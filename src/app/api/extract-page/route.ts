@@ -12,7 +12,9 @@ const requestSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  if (process.env.ENABLE_VISION_EXTRACTION !== "true") {
+  const visionEnabled = String(process.env.ENABLE_VISION_EXTRACTION) === "true";
+
+  if (!visionEnabled) {
     return NextResponse.json(
       {
         error: "Vision extraction is disabled.",

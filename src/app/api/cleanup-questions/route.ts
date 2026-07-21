@@ -42,7 +42,7 @@ const cleanupResponseSchema = z.object({
 });
 
 function getConfig() {
-  if (process.env.ENABLE_AI_CLEANUP !== "true") {
+  if (String(process.env.ENABLE_AI_CLEANUP) !== "true") {
     throw new Error("AI cleanup is disabled.");
   }
 
@@ -140,6 +140,8 @@ export async function POST(request: Request) {
       }
 
       const payload = (await response.json()) as {
+        model?: string;
+        usage?: Record<string, unknown>;
         choices?: Array<{ message?: { content?: string } }>;
       };
       const content = payload.choices?.[0]?.message?.content;
@@ -152,7 +154,13 @@ export async function POST(request: Request) {
       }
 
       const cleaned = cleanupResponseSchema.parse(JSON.parse(stripJsonFence(content)));
-      return NextResponse.json(cleaned);
+      const usage = payload.usage ?? null;
+      return NextResponse.json({
+        ...cleaned,
+        model: payload.model ?? config.model,
+        usage,
+        cost: readUsageCost(usage),
+      });
     } finally {
       clearTimeout(timeout);
     }
@@ -174,4 +182,14 @@ function stripJsonFence(value: string) {
   }
 
   return trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+}
+
+function readUsageCost(usage: unknown) {
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+
+  const record = usage as Record<string, unknown>;
+  const value = record.cost ?? record.total_cost;
+  return typeof value === "number" ? value : null;
 }

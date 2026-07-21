@@ -44,6 +44,18 @@ type MarkdownPage = {
   source: "native" | "ocr" | "empty";
   text: string;
 };
+type ApiJob = {
+  id: string;
+  statusUrl: string;
+  resultUrl: string;
+};
+type AiUsageRecord = {
+  provider: "openrouter";
+  purpose: "cleanup";
+  model?: string;
+  cost?: number | null;
+  usage?: unknown;
+};
 
 const MAX_RENDER_WIDTH = 1050;
 const IMAGE_QUALITY = 0.62;
@@ -556,6 +568,149 @@ function questionsToMarkdown(fileName: string, questions: CanonicalQuestion[]) {
   return lines.join("\n");
 }
 
+function buildFullMarkdown(fileName: string, questions: CanonicalQuestion[], markdownPages: MarkdownPage[]) {
+  return [
+    questionsToMarkdown(fileName, questions),
+    "",
+    "---",
+    "",
+    "# Page Text",
+    "",
+    ...markdownPages.map(pageToMarkdown),
+  ].join("\n");
+}
+
+function buildExportPayload({
+  fileName,
+  status,
+  questions,
+  assets,
+  warnings,
+  markdownPages,
+  usage,
+}: {
+  fileName: string;
+  status: string;
+  questions: CanonicalQuestion[];
+  assets: LocalAsset[];
+  warnings: string[];
+  markdownPages: MarkdownPage[];
+  usage: AiUsageRecord[];
+}) {
+  return {
+    schemaVersion: "1.0",
+    document: {
+      filename: fileName,
+      status,
+    },
+    statistics: {
+      totalQuestions: questions.length,
+      quizReady: questions.filter((question) => question.usabilityStatus === "quiz_ready").length,
+      needsReview: questions.filter((question) => question.usabilityStatus === "needs_review").length,
+      extractedAssets: assets.length,
+      pagesWithText: markdownPages.filter((page) => page.text.trim()).length,
+    },
+    questions,
+    assets: assets.map((asset) => ({
+      id: asset.id,
+      questionId: asset.questionId,
+      documentPageNumber: asset.documentPageNumber,
+      pageNumber: asset.pageNumber,
+      role: asset.role,
+      boundingBox: asset.boundingBox,
+      containsText: asset.containsText,
+      rawTranscription: asset.rawTranscription,
+      normalizedTranscription: asset.normalizedTranscription,
+      confidence: asset.confidence,
+      url: `/api/jobs/{jobId}/assets/${encodeURIComponent(asset.id)}`,
+    })),
+    pages: markdownPages,
+    warnings,
+    usage,
+  };
+}
+
+async function createApiJob(file: File): Promise<ApiJob> {
+  const response = await fetch("/api/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      fileSize: file.size,
+      contentType: file.type || "application/pdf",
+    }),
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+    throw new Error(payload?.message ?? "Could not create API job.");
+  }
+
+  const payload = (await response.json()) as {
+    jobId: string;
+    statusUrl: string;
+    resultUrl: string;
+  };
+
+  return { id: payload.jobId, statusUrl: payload.statusUrl, resultUrl: payload.resultUrl };
+}
+
+async function saveApiResult({
+  jobId,
+  resultJson,
+  markdown,
+  assets,
+  usage,
+  processingMs,
+}: {
+  jobId: string;
+  resultJson: unknown;
+  markdown: string;
+  assets: LocalAsset[];
+  usage: AiUsageRecord[];
+  processingMs: number;
+}) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/result`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      status: "completed",
+      resultJson,
+      markdown,
+      usage,
+      processingMs,
+      stats:
+        typeof resultJson === "object" && resultJson && "statistics" in resultJson
+          ? (resultJson as { statistics: unknown }).statistics
+          : undefined,
+      assets: assets
+        .filter((asset) => Boolean(asset.previewUrl))
+        .map((asset) => ({
+          id: asset.id,
+          pageNumber: asset.documentPageNumber,
+          questionId: asset.questionId,
+          role: asset.role,
+          contentType: dataUrlContentType(asset.previewUrl) ?? "image/webp",
+          dataUrl: asset.previewUrl,
+          width: Math.round(asset.boundingBox.width),
+          height: Math.round(asset.boundingBox.height),
+          boundingBox: asset.boundingBox,
+        })),
+    }),
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+    throw new Error(payload?.message ?? "Could not save API result.");
+  }
+
+  return (await response.json()) as { resultUrl: string; markdownUrl: string | null };
+}
+
+function dataUrlContentType(value?: string) {
+  return value?.match(/^data:([^;,]+)/)?.[1] ?? null;
+}
+
 function extractNativeTextPage(page: PageWork): PageExtraction {
   const text = page.nativeText
     .split(/\n+/)
@@ -702,29 +857,36 @@ function buildLabeledQuestion(
   }
 
   const questionId = `p${page.pageNumber}_q${questionIndex + 1}`;
-  const choices = choiceMatches.map((match, index) => ({
-    id: `${questionId}_c${index + 1}`,
-    label: match[1]?.toUpperCase() ?? null,
-    text: match[2]?.trim() || "Review choice",
-    orderIndex: index,
-    boundingBox: null,
-  }));
+  const answerFromBlock = extractAnswerFromLines(block.split(/\n+/));
+  const choices = choiceMatches
+    .map((match) => {
+      const label = match[1]?.toUpperCase() ?? null;
+      const text = cleanChoiceText(match[2]?.trim() || "", label);
+
+      return { label, text };
+    })
+    .filter((choice) => choice.text && !isAnswerLine(choice.text) && !isCategoryChoice(choice.text))
+    .map((choice, index) => ({
+      id: `${questionId}_c${index + 1}`,
+      label: choice.label,
+      text: choice.text,
+      orderIndex: index,
+      boundingBox: null,
+    }));
 
   if (!looksLikeRealExamStem(stem, choices.map((choice) => choice.text))) {
     return null;
   }
-
-  const answerMatch = block.match(/\b(?:Answer|Ans)\s*[:\-]?\s*([A-H])\b/i);
-  const answerLabel = answerMatch?.[1]?.toUpperCase() ?? null;
 
   return createNativeQuestion({
     page,
     questionIndex,
     stem,
     choices,
-    answerLabel,
-    answerRawText: answerMatch?.[0] ?? null,
-    confidence: answerLabel ? 0.82 : 0.72,
+    answerLabel: answerFromBlock.label,
+    answerRawText: answerFromBlock.rawText,
+    answerUncertain: answerFromBlock.uncertain,
+    confidence: answerFromBlock.label ? 0.82 : 0.72,
   });
 }
 
@@ -735,7 +897,7 @@ function buildRecallStyleQuestion(
 ): CanonicalQuestion | null {
   const lines = block
     .split(/\n+/)
-    .map((line) => line.replace(/\s+/g, " ").trim())
+    .map((line) => cleanOcrText(line).replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .filter((line) => !isHeaderOrComment(line));
 
@@ -743,26 +905,29 @@ function buildRecallStyleQuestion(
     return null;
   }
 
-  const questionEnd = lines.findIndex((line) => line.includes("?"));
+  const answerFromBlock = extractAnswerFromLines(lines);
+  const contentLines = answerFromBlock.lines;
+  const questionEnd = contentLines.findIndex((line) => line.includes("?"));
   let stemLines: string[];
   let choiceLines: string[];
 
-  if (questionEnd >= 0 && lines.length - questionEnd - 1 >= 2) {
-    stemLines = lines.slice(0, questionEnd + 1);
-    choiceLines = lines.slice(questionEnd + 1);
+  if (questionEnd >= 0 && contentLines.length - questionEnd - 1 >= 2) {
+    stemLines = contentLines.slice(0, questionEnd + 1);
+    choiceLines = contentLines.slice(questionEnd + 1);
   } else {
-    const trailingChoices = collectTrailingChoices(lines);
-    if (trailingChoices.length < 2 || trailingChoices.length >= lines.length) {
+    const trailingChoices = collectTrailingChoices(contentLines);
+    if (trailingChoices.length < 2 || trailingChoices.length >= contentLines.length) {
       return null;
     }
 
-    stemLines = lines.slice(0, lines.length - trailingChoices.length);
+    stemLines = contentLines.slice(0, contentLines.length - trailingChoices.length);
     choiceLines = trailingChoices;
   }
 
   choiceLines = choiceLines
     .map((line) => line.replace(/^[-*•]\s*/, "").trim())
-    .filter((line) => line && !isHeaderOrComment(line))
+    .map((line, index) => cleanChoiceText(line, String.fromCharCode(65 + index)))
+    .filter((line) => line && !isHeaderOrComment(line) && !isAnswerLine(line) && !isCategoryChoice(line))
     .slice(0, 6);
 
   if (choiceLines.length < 2 || !stemLines.join(" ").trim()) {
@@ -787,9 +952,10 @@ function buildRecallStyleQuestion(
     questionIndex,
     stem,
     choices,
-    answerLabel: null,
-    answerRawText: null,
-    confidence: 0.68,
+    answerLabel: answerFromBlock.label,
+    answerRawText: answerFromBlock.rawText,
+    answerUncertain: answerFromBlock.uncertain,
+    confidence: answerFromBlock.label ? 0.76 : 0.68,
   });
 }
 
@@ -814,7 +980,13 @@ function collectTrailingChoices(lines: string[]) {
 
 function looksLikeChoiceLine(line: string) {
   const wordCount = line.split(/\s+/).length;
-  return line.length <= 90 && wordCount <= 10 && !/^(and|or|but)\b/i.test(line);
+  return (
+    line.length <= 110 &&
+    wordCount <= 12 &&
+    !/^(and|or|but)\b/i.test(line) &&
+    !isAnswerLine(line) &&
+    !isCategoryChoice(line)
+  );
 }
 
 function looksLikeQuestionLine(line: string) {
@@ -859,8 +1031,77 @@ function isCategoryChoice(choice: string) {
   return (
     /^(?:[A-H]\s*)?(ENT|ER|Ophthalmology|General Surgery|Family Medicine|Psychiatry|Statistics|Orthopedic|Radiology|Pediatric|Gynecology|Internal Medicine|Dermatology)\s+Questions\b/i.test(
       choice,
-    ) || /^\(?\s*we are not sure of\s*\)?$/i.test(choice)
+    ) ||
+    /^(?:[A-H]\s*)?(ENT|ER|Ophthalmology|General Surgery|Family Medicine|Psychiatry|Statistics|Orthopedic|Radiology|Pediatric|Gynecology|Internal Medicine|Dermatology)\s*:\s*$/i.test(
+      choice,
+    ) ||
+    /^\(?\s*we are not sure of\s*\)?$/i.test(choice)
   );
+}
+
+function cleanOcrText(value: string) {
+  return value
+    .replace(/\u00d9/g, "ff")
+    .replace(/\u00fb/g, "fi")
+    .replace(/\u00f9/g, "fi")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanChoiceText(value: string, expectedLabel: string | null) {
+  let text = cleanOcrText(value)
+    .replace(/^[-*•]\s*/, "")
+    .replace(/^\(?\s*([A-H])\s*\)?[\).:-]\s*/i, "")
+    .trim();
+
+  if (expectedLabel) {
+    text = text.replace(new RegExp(`^${expectedLabel}\\s+[${expectedLabel}]?[\\).:-]?\\s*`, "i"), "").trim();
+  }
+
+  return text;
+}
+
+function parseAnswerLine(line: string) {
+  const match = line.match(/^(?:answer|ans|correct\s+answer)\s*[:\-]?\s*([A-H])\??(?:\b|$)/i);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    label: match[1].toUpperCase(),
+    rawText: line,
+    uncertain: /\?|not sure|unsure/i.test(line),
+  };
+}
+
+function isAnswerLine(line: string) {
+  return Boolean(parseAnswerLine(cleanOcrText(line)));
+}
+
+function extractAnswerFromLines(lines: string[]) {
+  let label: string | null = null;
+  let rawText: string | null = null;
+  let uncertain = false;
+  const remaining: string[] = [];
+
+  for (const line of lines) {
+    const answer = parseAnswerLine(line);
+    if (answer && !label) {
+      label = answer.label;
+      rawText = answer.rawText;
+      uncertain = answer.uncertain;
+      continue;
+    }
+
+    if (answer) {
+      continue;
+    }
+
+    remaining.push(line);
+  }
+
+  return { lines: remaining, label, rawText, uncertain };
 }
 
 function looksLikeQuestionStartLine(line: string) {
@@ -891,6 +1132,7 @@ function createNativeQuestion({
   choices,
   answerLabel,
   answerRawText,
+  answerUncertain = false,
   confidence,
 }: {
   page: PageWork;
@@ -899,6 +1141,7 @@ function createNativeQuestion({
   choices: CanonicalQuestion["versions"]["quizReady"]["choices"];
   answerLabel: string | null;
   answerRawText: string | null;
+  answerUncertain?: boolean;
   confidence: number;
 }): CanonicalQuestion | null {
   if (!stem || choices.length < 2) {
@@ -915,6 +1158,7 @@ function createNativeQuestion({
   const correctChoice = answerLabel
     ? normalizedChoices.find((choice) => choice.label === answerLabel)
     : null;
+  const answerStatus = answerLabel ? (answerUncertain ? "uncertain" : "explicit") : "missing";
 
   return {
     id: questionId,
@@ -932,10 +1176,10 @@ function createNativeQuestion({
     answer: {
       correctChoiceId: correctChoice?.id ?? null,
       sourceChoiceLabel: answerLabel,
-      status: answerLabel ? "explicit" : "missing",
+      status: answerStatus,
       rawAnswerText: answerRawText,
       evidenceIds: [],
-      confidence: answerLabel ? 0.7 : 0,
+      confidence: answerLabel ? (answerUncertain ? 0.45 : 0.7) : 0,
     },
     assets: [],
     completeness: {
@@ -949,18 +1193,18 @@ function createNativeQuestion({
       missingParts: answerLabel ? [] : ["answer"],
       score: confidence,
     },
-    usabilityStatus: answerLabel ? "quiz_ready" : "needs_review",
+    usabilityStatus: answerLabel && !answerUncertain ? "quiz_ready" : "needs_review",
     confidence: {
       segmentation: confidence,
       stem: confidence,
       choices: confidence,
-      answer: answerLabel ? 0.7 : 0,
+      answer: answerLabel ? (answerUncertain ? 0.45 : 0.7) : 0,
       imageAssociation: 1,
       duplicateResolution: 1,
       overall: confidence,
     },
     warnings: [],
-    reviewStatus: "review_required",
+    reviewStatus: answerUncertain ? "review_required" : "review_required",
   };
 }
 
@@ -979,6 +1223,9 @@ type CleanupResponse = {
     usabilityStatus: "quiz_ready" | "needs_review" | "incomplete" | "not_a_question";
     warnings: string[];
   }>;
+  usage?: unknown;
+  model?: string;
+  cost?: number | null;
 };
 
 async function cleanupQuestionsWithAi(questions: CanonicalQuestion[]) {
@@ -1091,6 +1338,8 @@ export default function Home() {
   const [useOcr, setUseOcr] = useState(false);
   const [useAiCleanup, setUseAiCleanup] = useState(true);
   const [markdownPages, setMarkdownPages] = useState<MarkdownPage[]>([]);
+  const [apiJob, setApiJob] = useState<ApiJob | null>(null);
+  const [aiUsage, setAiUsage] = useState<AiUsageRecord[]>([]);
 
   const approvedQuestions = useMemo(
     () =>
@@ -1127,15 +1376,32 @@ export default function Home() {
     setAssets([]);
     setWarnings([]);
     setMarkdownPages([]);
+    setApiJob(null);
+    setAiUsage([]);
     setQuizAnswers({});
     setSubmitted(false);
     setError("");
 
     try {
+      const runStartedAt = performance.now();
       const nextQuestions: CanonicalQuestion[] = [];
       const nextAssets: LocalAsset[] = [];
       const nextWarnings: string[] = [];
       const nextMarkdownPages: MarkdownPage[] = [];
+      const nextUsage: AiUsageRecord[] = [];
+      let currentApiJob: ApiJob | null = null;
+
+      try {
+        currentApiJob = await createApiJob(file);
+        setApiJob(currentApiJob);
+      } catch (apiError) {
+        nextWarnings.push(
+          `API job tracking unavailable: ${
+            apiError instanceof Error ? apiError.message : "failed"
+          }`,
+        );
+        setWarnings([...nextWarnings]);
+      }
 
       setPhase("rendering");
       await renderPdfPages(file, (current, total, label) => {
@@ -1234,6 +1500,16 @@ export default function Home() {
 
         try {
           const cleanup = await cleanupQuestionsWithAi(nextQuestions);
+          if (cleanup.usage || cleanup.cost !== undefined || cleanup.model) {
+            nextUsage.push({
+              provider: "openrouter",
+              purpose: "cleanup",
+              model: cleanup.model,
+              cost: cleanup.cost ?? null,
+              usage: cleanup.usage ?? null,
+            });
+            setAiUsage([...nextUsage]);
+          }
           const cleanedQuestions = applyCleanup(nextQuestions, cleanup);
           nextQuestions.splice(0, nextQuestions.length, ...cleanedQuestions);
           setQuestions([...nextQuestions]);
@@ -1245,6 +1521,37 @@ export default function Home() {
           const message =
             cleanupError instanceof Error ? cleanupError.message : "AI cleanup failed.";
           nextWarnings.push(`AI cleanup skipped: ${message}`);
+          setWarnings([...nextWarnings]);
+        }
+      }
+
+      if (currentApiJob) {
+        try {
+          const markdown = buildFullMarkdown(file.name, nextQuestions, nextMarkdownPages);
+          const resultJson = buildExportPayload({
+            fileName: file.name,
+            status: "completed",
+            questions: nextQuestions,
+            assets: nextAssets,
+            warnings: nextWarnings,
+            markdownPages: nextMarkdownPages,
+            usage: nextUsage,
+          });
+          const saved = await saveApiResult({
+            jobId: currentApiJob.id,
+            resultJson,
+            markdown,
+            assets: nextAssets,
+            usage: nextUsage,
+            processingMs: Math.round(performance.now() - runStartedAt),
+          });
+          setApiJob({ ...currentApiJob, resultUrl: saved.resultUrl });
+        } catch (apiError) {
+          nextWarnings.push(
+            `API result save failed: ${
+              apiError instanceof Error ? apiError.message : "failed"
+            }`,
+          );
           setWarnings([...nextWarnings]);
         }
       }
@@ -1286,22 +1593,15 @@ export default function Home() {
   }
 
   function exportJson() {
-    const payload = {
-      schemaVersion: "1.0",
-      document: {
-        filename: fileName,
-        status: phase === "done" ? "completed" : phase,
-      },
-      statistics: {
-        totalQuestions: questions.length,
-        quizReady: questions.filter((question) => question.usabilityStatus === "quiz_ready").length,
-        needsReview: questions.filter((question) => question.usabilityStatus === "needs_review").length,
-        extractedAssets: assets.length,
-      },
+    const payload = buildExportPayload({
+      fileName,
+      status: phase === "done" ? "completed" : phase,
       questions,
       assets,
       warnings,
-    };
+      markdownPages,
+      usage: aiUsage,
+    });
     const url = URL.createObjectURL(
       new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
     );
@@ -1367,6 +1667,8 @@ export default function Home() {
                   setAssets([]);
                   setWarnings([]);
                   setMarkdownPages([]);
+                  setApiJob(null);
+                  setAiUsage([]);
                   setProgress({ current: 0, total: 0, label: "" });
                   setError("");
                 }}
@@ -1466,6 +1768,30 @@ export default function Home() {
               </div>
             ) : null}
             {error ? <p className="mt-4 text-sm text-rose-700">{error}</p> : null}
+            {apiJob ? (
+              <div className="mt-4 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-900">
+                <p className="font-medium">API job</p>
+                <p className="mt-1 font-mono">{apiJob.id}</p>
+                <a
+                  href={apiJob.resultUrl}
+                  className="mt-2 inline-block font-medium underline underline-offset-2"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Result JSON
+                </a>
+              </div>
+            ) : null}
+            {aiUsage.length ? (
+              <div className="mt-3 rounded-md border border-zinc-200 bg-white p-3 text-xs text-zinc-600">
+                <p className="font-medium text-zinc-800">OpenRouter usage</p>
+                {aiUsage.map((usage, index) => (
+                  <p key={`${usage.purpose}-${index}`} className="mt-1">
+                    {usage.purpose}: {usage.cost == null ? "cost not reported" : `$${usage.cost.toFixed(6)}`}
+                  </p>
+                ))}
+              </div>
+            ) : null}
           </aside>
         </section>
 
@@ -1612,15 +1938,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={() => {
-                  const markdown = [
-                    questionsToMarkdown(fileName, questions),
-                    "",
-                    "---",
-                    "",
-                    "# Page Text",
-                    "",
-                    ...markdownPages.map(pageToMarkdown),
-                  ].join("\n");
+                  const markdown = buildFullMarkdown(fileName, questions, markdownPages);
                   const url = URL.createObjectURL(
                     new Blob([markdown], { type: "text/markdown" }),
                   );
@@ -1638,15 +1956,7 @@ export default function Home() {
               </button>
             </div>
             <pre className="max-h-[720px] overflow-auto rounded-lg border border-zinc-200 bg-white p-4 text-sm leading-6 text-zinc-800 shadow-sm whitespace-pre-wrap">
-              {[
-                questionsToMarkdown(fileName, questions),
-                "",
-                "---",
-                "",
-                "# Page Text",
-                "",
-                ...markdownPages.map(pageToMarkdown),
-              ].join("\n")}
+              {buildFullMarkdown(fileName, questions, markdownPages)}
             </pre>
           </section>
         ) : null}
@@ -1773,7 +2083,19 @@ export default function Home() {
 
         {tab === "json" ? (
           <pre className="max-h-[720px] overflow-auto rounded-lg border border-zinc-200 bg-zinc-950 p-4 text-xs leading-5 text-zinc-100 shadow-sm">
-            {JSON.stringify({ fileName, questions, assets, warnings }, null, 2)}
+            {JSON.stringify(
+              buildExportPayload({
+                fileName,
+                status: phase === "done" ? "completed" : phase,
+                questions,
+                assets,
+                warnings,
+                markdownPages,
+                usage: aiUsage,
+              }),
+              null,
+              2,
+            )}
           </pre>
         ) : null}
       </div>

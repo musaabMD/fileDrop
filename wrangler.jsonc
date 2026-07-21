@@ -14,6 +14,19 @@
       "service": "filedrop"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "filedrop",
+      "database_id": "6c7e7e77-3ddd-4b81-86f3-473be3cf2bf1"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "filedrop-files"
+    }
+  ],
   "vars": {
     "OPENROUTER_MODEL_PAGE_EXTRACTION": "google/gemini-2.5-flash",
     "OPENROUTER_MODEL_RECONCILIATION": "google/gemini-2.5-flash",
@@ -23,6 +36,7 @@
     "ENABLE_VISION_EXTRACTION": "false",
     "MAX_VISION_PAGES_PER_RUN": "3",
     "ENABLE_AI_CLEANUP": "true",
-    "MAX_AI_CLEANUP_QUESTIONS_PER_RUN": "20"
+    "MAX_AI_CLEANUP_QUESTIONS_PER_RUN": "20",
+    "MAX_AI_TEXT_CHARS": "60000"
   }
 }
