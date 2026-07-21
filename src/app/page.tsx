@@ -29,6 +29,7 @@ type PageWork = {
   height: number;
   nativeText: string;
   imageDataUrl: string;
+  imageBoxes: BoundingBox[];
 };
 
 type LocalAsset = QuestionAsset & {
@@ -101,6 +102,346 @@ async function cropAsset(
   return canvas.toDataURL("image/webp", 0.9);
 }
 
+async function detectVisualAssets(page: PageWork): Promise<LocalAsset[]> {
+  if (page.imageBoxes.length) {
+    return page.imageBoxes.map((box, index) => ({
+      id: `p${page.pageNumber}_pdf_image_${index + 1}`,
+      questionId: null,
+      documentPageNumber: page.pageNumber,
+      pageNumber: page.pageNumber,
+      role: "part_of_question",
+      boundingBox: box,
+      containsText: false,
+      rawTranscription: null,
+      normalizedTranscription: null,
+      confidence: 0.9,
+    }));
+  }
+
+  const image = await loadImage(page.imageDataUrl);
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d", { alpha: false });
+  const cellSize = 16;
+
+  if (!context) {
+    return [];
+  }
+
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  context.drawImage(image, 0, 0);
+
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const columns = Math.ceil(canvas.width / cellSize);
+  const rows = Math.ceil(canvas.height / cellSize);
+  const active = Array.from({ length: rows }, () => Array(columns).fill(false) as boolean[]);
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      let nonWhite = 0;
+      let total = 0;
+
+      for (let y = row * cellSize; y < Math.min(canvas.height, (row + 1) * cellSize); y += 2) {
+        for (let x = column * cellSize; x < Math.min(canvas.width, (column + 1) * cellSize); x += 2) {
+          const offset = (y * canvas.width + x) * 4;
+          const red = imageData.data[offset] ?? 255;
+          const green = imageData.data[offset + 1] ?? 255;
+          const blue = imageData.data[offset + 2] ?? 255;
+          const isDark = red < 220 || green < 220 || blue < 220;
+          const isColored = Math.max(red, green, blue) - Math.min(red, green, blue) > 35;
+
+          if (isDark || isColored) {
+            nonWhite += 1;
+          }
+          total += 1;
+        }
+      }
+
+      active[row][column] = total > 0 && nonWhite / total > 0.18;
+    }
+  }
+
+  const visited = Array.from({ length: rows }, () => Array(columns).fill(false) as boolean[]);
+  const boxes: BoundingBox[] = [];
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      if (!active[row][column] || visited[row][column]) {
+        continue;
+      }
+
+      const queue: Array<[number, number]> = [[row, column]];
+      visited[row][column] = true;
+      let minRow = row;
+      let maxRow = row;
+      let minColumn = column;
+      let maxColumn = column;
+
+      while (queue.length) {
+        const [currentRow, currentColumn] = queue.shift()!;
+        minRow = Math.min(minRow, currentRow);
+        maxRow = Math.max(maxRow, currentRow);
+        minColumn = Math.min(minColumn, currentColumn);
+        maxColumn = Math.max(maxColumn, currentColumn);
+
+        for (const [nextRow, nextColumn] of [
+          [currentRow - 1, currentColumn],
+          [currentRow + 1, currentColumn],
+          [currentRow, currentColumn - 1],
+          [currentRow, currentColumn + 1],
+        ]) {
+          if (
+            nextRow < 0 ||
+            nextColumn < 0 ||
+            nextRow >= rows ||
+            nextColumn >= columns ||
+            visited[nextRow][nextColumn] ||
+            !active[nextRow][nextColumn]
+          ) {
+            continue;
+          }
+
+          visited[nextRow][nextColumn] = true;
+          queue.push([nextRow, nextColumn]);
+        }
+      }
+
+      const box = {
+        x: Math.max(0, minColumn * cellSize - 6),
+        y: Math.max(0, minRow * cellSize - 6),
+        width: Math.min(canvas.width, (maxColumn - minColumn + 1) * cellSize + 12),
+        height: Math.min(canvas.height, (maxRow - minRow + 1) * cellSize + 12),
+      };
+
+      const area = box.width * box.height;
+      const aspect = box.width / box.height;
+      const pageArea = canvas.width * canvas.height;
+      const density = measureNonWhiteDensity(imageData, canvas.width, canvas.height, box);
+
+      if (
+        area > pageArea * 0.012 &&
+        box.width > 90 &&
+        box.height > 70 &&
+        density > 0.14 &&
+        aspect > 0.25 &&
+        aspect < 8
+      ) {
+        boxes.push(box);
+      }
+    }
+  }
+
+  return mergeBoxes(boxes)
+    .sort((a, b) => a.y - b.y)
+    .slice(0, 8)
+    .map((box, index) => ({
+      id: `p${page.pageNumber}_visual_${index + 1}`,
+      questionId: null,
+      documentPageNumber: page.pageNumber,
+      pageNumber: page.pageNumber,
+      role: "part_of_question",
+      boundingBox: box,
+      containsText: false,
+      rawTranscription: null,
+      normalizedTranscription: null,
+      confidence: 0.62,
+    }));
+}
+
+type OperatorListPage = {
+  getOperatorList: () => Promise<{
+    fnArray: number[];
+    argsArray: unknown[];
+  }>;
+};
+
+type PdfViewport = {
+  transform: number[];
+};
+
+async function extractPdfImageBoxes(
+  page: OperatorListPage,
+  viewport: PdfViewport,
+  ops: Record<string, number>,
+) {
+  const operatorList = await page.getOperatorList();
+  const boxes: BoundingBox[] = [];
+  let currentTransform: number[] | null = null;
+
+  for (let index = 0; index < operatorList.fnArray.length; index += 1) {
+    const fn = operatorList.fnArray[index];
+    const args = operatorList.argsArray[index];
+
+    if (fn === ops.transform && Array.isArray(args) && args.length >= 6) {
+      currentTransform = args.map(Number).slice(0, 6);
+      continue;
+    }
+
+    if (
+      (fn === ops.paintImageXObject ||
+        fn === ops.paintJpegXObject ||
+        fn === ops.paintInlineImageXObject) &&
+      currentTransform
+    ) {
+      const [a, b, c, d, e, f] = currentTransform;
+      if ([a, b, c, d, e, f].some((value) => !Number.isFinite(value))) {
+        continue;
+      }
+
+      const left = Math.min(e, e + a + c);
+      const right = Math.max(e, e + a + c);
+      const bottom = Math.min(f, f + b + d);
+      const top = Math.max(f, f + b + d);
+      const topLeft = applyViewportTransform(viewport.transform, left, top);
+      const bottomRight = applyViewportTransform(viewport.transform, right, bottom);
+      const x1 = Math.min(topLeft.x, bottomRight.x);
+      const y1 = Math.min(topLeft.y, bottomRight.y);
+      const x2 = Math.max(topLeft.x, bottomRight.x);
+      const y2 = Math.max(topLeft.y, bottomRight.y);
+      const width = x2 - x1;
+      const height = y2 - y1;
+
+      if (width > 60 && height > 60) {
+        boxes.push({
+          x: Math.max(0, x1),
+          y: Math.max(0, y1),
+          width,
+          height,
+        });
+      }
+    }
+  }
+
+  return mergeBoxes(boxes).slice(0, 12);
+}
+
+function applyViewportTransform(transform: number[], x: number, y: number) {
+  const [a = 1, b = 0, c = 0, d = 1, e = 0, f = 0] = transform;
+
+  return {
+    x: a * x + c * y + e,
+    y: b * x + d * y + f,
+  };
+}
+
+function measureNonWhiteDensity(
+  imageData: ImageData,
+  canvasWidth: number,
+  canvasHeight: number,
+  box: BoundingBox,
+) {
+  let nonWhite = 0;
+  let total = 0;
+  const startX = Math.max(0, Math.floor(box.x));
+  const startY = Math.max(0, Math.floor(box.y));
+  const endX = Math.min(canvasWidth, Math.ceil(box.x + box.width));
+  const endY = Math.min(canvasHeight, Math.ceil(box.y + box.height));
+
+  for (let y = startY; y < endY; y += 3) {
+    for (let x = startX; x < endX; x += 3) {
+      const offset = (y * canvasWidth + x) * 4;
+      const red = imageData.data[offset] ?? 255;
+      const green = imageData.data[offset + 1] ?? 255;
+      const blue = imageData.data[offset + 2] ?? 255;
+
+      if (red < 225 || green < 225 || blue < 225) {
+        nonWhite += 1;
+      }
+      total += 1;
+    }
+  }
+
+  return total ? nonWhite / total : 0;
+}
+
+function mergeBoxes(boxes: BoundingBox[]) {
+  const merged: BoundingBox[] = [];
+
+  for (const box of boxes.sort((a, b) => a.y - b.y || a.x - b.x)) {
+    const match = merged.find((candidate) => boxesAreClose(candidate, box));
+
+    if (!match) {
+      merged.push({ ...box });
+      continue;
+    }
+
+    const x1 = Math.min(match.x, box.x);
+    const y1 = Math.min(match.y, box.y);
+    const x2 = Math.max(match.x + match.width, box.x + box.width);
+    const y2 = Math.max(match.y + match.height, box.y + box.height);
+
+    match.x = x1;
+    match.y = y1;
+    match.width = x2 - x1;
+    match.height = y2 - y1;
+  }
+
+  return merged;
+}
+
+function boxesAreClose(a: BoundingBox, b: BoundingBox) {
+  const horizontalGap = Math.max(0, Math.max(a.x, b.x) - Math.min(a.x + a.width, b.x + b.width));
+  const verticalGap = Math.max(0, Math.max(a.y, b.y) - Math.min(a.y + a.height, b.y + b.height));
+  const verticalOverlap = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+
+  return (
+    (horizontalGap < 36 && verticalGap < 36) ||
+    (horizontalGap < 80 && verticalOverlap > Math.min(a.height, b.height) * 0.45)
+  );
+}
+
+async function finalizeVisualAssets(page: PageWork, assets: LocalAsset[], questions: CanonicalQuestion[]) {
+  const pageQuestions = questions.map((question) => ({ ...question, assets: [...question.assets] }));
+
+  const finalizedAssets = await Promise.all(
+    assets.map(async (asset, index) => {
+      const targetQuestion = pickQuestionForAsset(pageQuestions, asset, index);
+      const previewUrl = await cropAsset(
+        page.imageDataUrl,
+        page.width,
+        page.height,
+        asset.boundingBox,
+      ).catch(() => undefined);
+
+      if (targetQuestion && !targetQuestion.assets.includes(asset.id)) {
+        targetQuestion.assets.push(asset.id);
+      }
+
+      return {
+        ...asset,
+        questionId: targetQuestion?.id ?? null,
+        previewUrl,
+      };
+    }),
+  );
+
+  return { questions: pageQuestions, assets: finalizedAssets };
+}
+
+function pickQuestionForAsset(
+  questions: CanonicalQuestion[],
+  asset: LocalAsset,
+  assetIndex: number,
+) {
+  if (!questions.length) {
+    return null;
+  }
+
+  const imageQuestions = questions.filter((question) =>
+    /\b(image|x-?ray|radiograph|ct|mri|ultrasound|scan|report|chest)\b/i.test(
+      question.versions.quizReady.stem,
+    ),
+  );
+
+  if (imageQuestions.length) {
+    return imageQuestions[Math.min(assetIndex, imageQuestions.length - 1)];
+  }
+
+  const verticalRatio = asset.boundingBox.y / Math.max(1, asset.boundingBox.y + asset.boundingBox.height);
+  const indexByPosition = Math.floor(verticalRatio * questions.length);
+  return questions[Math.min(assetIndex, indexByPosition, questions.length - 1)] ?? questions[0];
+}
+
 async function renderPdfPages(
   file: File,
   onProgress: (page: number, total: number, label: string) => void,
@@ -144,12 +485,15 @@ async function renderPdfPages(
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 
+    const imageBoxes = await extractPdfImageBoxes(page, viewport, pdfjs.OPS).catch(() => []);
+
     await onPage({
       pageNumber,
       width: canvas.width,
       height: canvas.height,
       nativeText,
       imageDataUrl: canvas.toDataURL("image/jpeg", IMAGE_QUALITY),
+      imageBoxes,
     }, pdf.numPages);
   }
 }
@@ -671,10 +1015,20 @@ export default function Home() {
           const nativeResult = extractNativeTextPage(pageForExtraction);
           const needsVision = useVision && nativeResult.questions.length === 0 && page.pageNumber <= MAX_VISION_PAGES;
           const result = needsVision ? await extractPage(file.name, pageForExtraction) : nativeResult;
-          nextQuestions.push(...result.questions);
+          const visualCandidates = await detectVisualAssets(page);
+          const localVisuals = visualCandidates.filter(
+            (asset) =>
+              !result.assets.some(
+                (existing) =>
+                  Math.abs(existing.boundingBox.x - asset.boundingBox.x) < 24 &&
+                  Math.abs(existing.boundingBox.y - asset.boundingBox.y) < 24,
+              ),
+          );
+          const finalizedVisuals = await finalizeVisualAssets(page, localVisuals, result.questions);
+          nextQuestions.push(...finalizedVisuals.questions);
           nextWarnings.push(...result.warnings.map((warning) => `Page ${page.pageNumber}: ${warning}`));
 
-          for (const asset of result.assets) {
+          for (const asset of [...result.assets, ...finalizedVisuals.assets]) {
             const previewUrl = await cropAsset(
               page.imageDataUrl,
               result.page.width,
@@ -685,7 +1039,10 @@ export default function Home() {
             nextAssets.push({
               ...asset,
               documentPageNumber: page.pageNumber,
-              previewUrl,
+              previewUrl:
+                "previewUrl" in asset && typeof asset.previewUrl === "string"
+                  ? asset.previewUrl
+                  : previewUrl,
             });
           }
 
