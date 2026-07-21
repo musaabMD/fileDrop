@@ -5,6 +5,7 @@
 import {
   Check,
   Download,
+  Filter,
   FileText,
   FileUp,
   Loader2,
@@ -708,6 +709,11 @@ function buildLabeledQuestion(
     orderIndex: index,
     boundingBox: null,
   }));
+
+  if (!looksLikeRealExamStem(stem, choices.map((choice) => choice.text))) {
+    return null;
+  }
+
   const answerMatch = block.match(/\b(?:Answer|Ans)\s*[:\-]?\s*([A-H])\b/i);
   const answerLabel = answerMatch?.[1]?.toUpperCase() ?? null;
 
@@ -763,6 +769,11 @@ function buildRecallStyleQuestion(
     return null;
   }
 
+  const stem = stemLines.join(" ").replace(/^(?:Q(?:uestion)?\s*)?\d{1,4}[\).:-]\s*/i, "").trim();
+  if (!looksLikeRealExamStem(stem, choiceLines)) {
+    return null;
+  }
+
   const choices = choiceLines.map((line, index) => ({
     id: `p${page.pageNumber}_q${questionIndex + 1}_c${index + 1}`,
     label: String.fromCharCode(65 + index),
@@ -774,7 +785,7 @@ function buildRecallStyleQuestion(
   return createNativeQuestion({
     page,
     questionIndex,
-    stem: stemLines.join(" ").replace(/^(?:Q(?:uestion)?\s*)?\d{1,4}[\).:-]\s*/i, "").trim(),
+    stem,
     choices,
     answerLabel: null,
     answerRawText: null,
@@ -813,6 +824,45 @@ function looksLikeQuestionLine(line: string) {
   );
 }
 
+function looksLikeRealExamStem(stem: string, choices: string[]) {
+  const normalizedStem = stem.replace(/\s+/g, " ").trim();
+  const normalizedChoices = choices.join(" ").replace(/\s+/g, " ");
+
+  if (isNonQuestionStem(normalizedStem) || choices.some(isCategoryChoice)) {
+    return false;
+  }
+
+  return (
+    normalizedStem.includes("?") ||
+    /\b(patient|woman|man|male|female|child|boy|girl|newborn|infant|pregnant|presents?|diagnosis|management|treatment|next step|most likely|appropriate|initial|confirm|screening|investigation|therapy|complication)\b/i.test(
+      normalizedStem,
+    ) ||
+    /\b(allopurinol|hydroxyurea|transfusion|antibiotic|surgery|ocp|calcium|glucose|cortisol|metanephrines|ultrasound|ct|mri|x-?ray)\b/i.test(
+      normalizedChoices,
+    )
+  );
+}
+
+function isNonQuestionStem(stem: string) {
+  return (
+    /Questions written by many/i.test(stem) ||
+    /Collected\s*&\s*Edited by/i.test(stem) ||
+    /\bTelegram\b|\bMOF Group\b/i.test(stem) ||
+    /لا تنسوا|دعواتكم|بالتوفيق|التيسير/.test(stem) ||
+    /\b(Family Medicine|Psychiatry|Statistics|Orthopedic|Radiology|Pediatric|Gynecology|Internal Medicine|Dermatology)\s+Questions\b/i.test(
+      stem,
+    )
+  );
+}
+
+function isCategoryChoice(choice: string) {
+  return (
+    /^(?:[A-H]\s*)?(ENT|ER|Ophthalmology|General Surgery|Family Medicine|Psychiatry|Statistics|Orthopedic|Radiology|Pediatric|Gynecology|Internal Medicine|Dermatology)\s+Questions\b/i.test(
+      choice,
+    ) || /^\(?\s*we are not sure of\s*\)?$/i.test(choice)
+  );
+}
+
 function looksLikeQuestionStartLine(line: string) {
   return (
     /^(?:\d{1,4}[\).:-]\s*)?(?:a|an|the)?\s*(patient|woman|man|male|female|child|boy|girl|newborn|infant|pregnant|question|pt)\b/i.test(line) ||
@@ -826,7 +876,11 @@ function isHeaderOrComment(line: string) {
     /^Tried to remember/i.test(line) ||
     /^The missing questions/i.test(line) ||
     /^Wish you all/i.test(line) ||
-    /^Alhomrani:/i.test(line)
+    /^Alhomrani:/i.test(line) ||
+    /Questions written by many/i.test(line) ||
+    /Collected\s*&\s*Edited by/i.test(line) ||
+    /\bTelegram\b|\bMOF Group\b/i.test(line) ||
+    /^Notes?:/i.test(line)
   );
 }
 
@@ -910,6 +964,117 @@ function createNativeQuestion({
   };
 }
 
+type CleanupResponse = {
+  questions: Array<{
+    id: string;
+    keep: boolean;
+    stem: string;
+    choices: Array<{
+      id: string;
+      label: string | null;
+      text: string;
+      keep: boolean;
+    }>;
+    reviewStatus: "approved" | "review_required" | "rejected";
+    usabilityStatus: "quiz_ready" | "needs_review" | "incomplete" | "not_a_question";
+    warnings: string[];
+  }>;
+};
+
+async function cleanupQuestionsWithAi(questions: CanonicalQuestion[]) {
+  const response = await fetch("/api/cleanup-questions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      questions: questions.map((question) => ({
+        id: question.id,
+        pageNumbers: question.source.pageNumbers,
+        stem: question.versions.quizReady.stem,
+        choices: question.versions.quizReady.choices.map((choice) => ({
+          id: choice.id,
+          label: choice.label,
+          text: choice.text,
+        })),
+      })),
+    }),
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+    throw new Error(payload?.message ?? "AI cleanup failed.");
+  }
+
+  return (await response.json()) as CleanupResponse;
+}
+
+function applyCleanup(
+  questions: CanonicalQuestion[],
+  cleanup: CleanupResponse,
+): CanonicalQuestion[] {
+  const cleanupById = new Map(cleanup.questions.map((question) => [question.id, question]));
+
+  return questions
+    .map((question) => {
+      const cleaned = cleanupById.get(question.id);
+      if (!cleaned) {
+        return question;
+      }
+
+      if (!cleaned.keep) {
+        return {
+          ...question,
+          usabilityStatus: "not_a_question" as const,
+          reviewStatus: "rejected" as const,
+          warnings: [...question.warnings, ...cleaned.warnings],
+        };
+      }
+
+      const choiceById = new Map(question.versions.quizReady.choices.map((choice) => [choice.id, choice]));
+      const choices = cleaned.choices
+        .filter((choice) => choice.keep)
+        .map((choice, index) => ({
+          ...(choiceById.get(choice.id) ?? {
+            id: choice.id,
+            label: choice.label,
+            orderIndex: index,
+            boundingBox: null,
+          }),
+          label: choice.label,
+          text: choice.text,
+          orderIndex: index,
+        }));
+      const correctChoiceStillExists =
+        question.answer.correctChoiceId &&
+        choices.some((choice) => choice.id === question.answer.correctChoiceId);
+
+      return {
+        ...question,
+        versions: {
+          source: question.versions.source,
+          normalized: {
+            stem: cleaned.stem,
+            choices,
+          },
+          quizReady: {
+            stem: cleaned.stem,
+            choices,
+          },
+        },
+        answer: correctChoiceStillExists
+          ? question.answer
+          : {
+              ...question.answer,
+              correctChoiceId: null,
+              status: question.answer.status === "explicit" ? "uncertain" : question.answer.status,
+            },
+        usabilityStatus: cleaned.usabilityStatus,
+        reviewStatus: cleaned.reviewStatus,
+        warnings: [...question.warnings, ...cleaned.warnings],
+      };
+    })
+    .filter((question) => question.usabilityStatus !== "not_a_question");
+}
+
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -924,6 +1089,7 @@ export default function Home() {
   const [submitted, setSubmitted] = useState(false);
   const [useVision, setUseVision] = useState(false);
   const [useOcr, setUseOcr] = useState(false);
+  const [useAiCleanup, setUseAiCleanup] = useState(true);
   const [markdownPages, setMarkdownPages] = useState<MarkdownPage[]>([]);
 
   const approvedQuestions = useMemo(
@@ -1058,6 +1224,30 @@ export default function Home() {
           setWarnings([...nextWarnings]);
         }
       });
+
+      if (useAiCleanup && nextQuestions.length) {
+        setProgress({
+          current: progress.total || nextMarkdownPages.length,
+          total: progress.total || nextMarkdownPages.length,
+          label: "cleaning extracted questions",
+        });
+
+        try {
+          const cleanup = await cleanupQuestionsWithAi(nextQuestions);
+          const cleanedQuestions = applyCleanup(nextQuestions, cleanup);
+          nextQuestions.splice(0, nextQuestions.length, ...cleanedQuestions);
+          setQuestions([...nextQuestions]);
+          setWarnings([
+            ...nextWarnings,
+            `AI cleanup checked ${cleanup.questions.length} question candidates.`,
+          ]);
+        } catch (cleanupError) {
+          const message =
+            cleanupError instanceof Error ? cleanupError.message : "AI cleanup failed.";
+          nextWarnings.push(`AI cleanup skipped: ${message}`);
+          setWarnings([...nextWarnings]);
+        }
+      }
 
       setPhase("done");
       setTab("review");
@@ -1221,6 +1411,24 @@ export default function Home() {
                 <span className="mt-1 block text-xs leading-5 text-zinc-500">
                   Runs in this browser with Tesseract. No OpenRouter call. Slower
                   on image-only pages.
+                </span>
+              </span>
+            </label>
+            <label className="mt-4 flex items-start gap-3 rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm">
+              <input
+                type="checkbox"
+                checked={useAiCleanup}
+                onChange={(event) => setUseAiCleanup(event.target.checked)}
+                className="mt-1"
+              />
+              <span>
+                <span className="flex items-center gap-2 font-medium text-zinc-800">
+                  <Filter className="h-4 w-4" />
+                  AI cleanup
+                </span>
+                <span className="mt-1 block text-xs leading-5 text-zinc-500">
+                  Text only, capped at 20 candidates. Removes cover pages and
+                  unrelated choices. No page images are sent.
                 </span>
               </span>
             </label>

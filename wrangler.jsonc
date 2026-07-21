@@ -18,8 +18,11 @@
     "OPENROUTER_MODEL_PAGE_EXTRACTION": "google/gemini-2.5-flash",
     "OPENROUTER_MODEL_RECONCILIATION": "google/gemini-2.5-flash",
     "OPENROUTER_MODEL_GENERATION": "google/gemini-2.5-flash",
+    "OPENROUTER_MODEL_CLEANUP": "google/gemini-2.5-flash",
     "OPENROUTER_APP_NAME": "fileDrop",
     "ENABLE_VISION_EXTRACTION": "false",
-    "MAX_VISION_PAGES_PER_RUN": "3"
+    "MAX_VISION_PAGES_PER_RUN": "3",
+    "ENABLE_AI_CLEANUP": "true",
+    "MAX_AI_CLEANUP_QUESTIONS_PER_RUN": "20"
   }
 }
