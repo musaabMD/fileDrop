@@ -37,8 +37,8 @@ type LocalAsset = QuestionAsset & {
 
 type QuizAnswer = Record<string, string>;
 
-const MAX_RENDER_WIDTH = 1500;
-const IMAGE_QUALITY = 0.82;
+const MAX_RENDER_WIDTH = 1050;
+const IMAGE_QUALITY = 0.62;
 
 function statusTone(status: CanonicalQuestion["usabilityStatus"]) {
   if (status === "quiz_ready") return "bg-emerald-50 text-emerald-700 ring-emerald-200";
@@ -94,15 +94,18 @@ async function cropAsset(
   return canvas.toDataURL("image/webp", 0.9);
 }
 
-async function renderPdf(file: File, onProgress: (page: number, total: number) => void) {
+async function renderPdfPages(
+  file: File,
+  onProgress: (page: number, total: number, label: string) => void,
+  onPage: (page: PageWork, total: number) => Promise<void>,
+) {
   const pdfjs = await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
   const pdf = await pdfjs.getDocument({ data: await readFileBuffer(file) }).promise;
-  const pages: PageWork[] = [];
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    onProgress(pageNumber, pdf.numPages);
+    onProgress(pageNumber, pdf.numPages, "rendering page");
     const page = await pdf.getPage(pageNumber);
     const baseViewport = page.getViewport({ scale: 1 });
     const scale = Math.min(2, MAX_RENDER_WIDTH / baseViewport.width);
@@ -126,16 +129,14 @@ async function renderPdf(file: File, onProgress: (page: number, total: number) =
       .filter(Boolean)
       .join(" ");
 
-    pages.push({
+    await onPage({
       pageNumber,
       width: canvas.width,
       height: canvas.height,
       nativeText,
       imageDataUrl: canvas.toDataURL("image/jpeg", IMAGE_QUALITY),
-    });
+    }, pdf.numPages);
   }
-
-  return pages;
 }
 
 async function extractPage(fileName: string, page: PageWork) {
@@ -205,22 +206,19 @@ export default function Home() {
     setError("");
 
     try {
-      setPhase("rendering");
-      const pages = await renderPdf(file, (current, total) =>
-        setProgress({ current, total, label: "rendering pages" }),
-      );
-
       const nextQuestions: CanonicalQuestion[] = [];
       const nextAssets: LocalAsset[] = [];
       const nextWarnings: string[] = [];
 
-      setPhase("extracting");
-
-      for (const page of pages) {
+      setPhase("rendering");
+      await renderPdfPages(file, (current, total, label) => {
+        setProgress({ current, total, label });
+      }, async (page, total) => {
+        setPhase("extracting");
         setProgress({
           current: page.pageNumber,
-          total: pages.length,
-          label: "extracting questions",
+          total,
+          label: "extracting page",
         });
 
         try {
@@ -254,7 +252,7 @@ export default function Home() {
           );
           setWarnings([...nextWarnings]);
         }
-      }
+      });
 
       setPhase("done");
       setTab("review");
