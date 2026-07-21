@@ -11,6 +11,7 @@ Fast PDF dropzone for extracting exam questions with OpenRouter vision models.
 - Blocks OpenRouter vision calls unless `ENABLE_VISION_EXTRACTION=true`.
 - Uses capped text-only OpenRouter cleanup to remove fake choices and reject non-question pages.
 - Stores API processing jobs in D1 and JSON, Markdown, source files, and image crops in R2.
+- Creates client API keys from `/admin` and tracks calls, jobs, failures, latency, and OpenRouter cost per key.
 - Separates review, Markdown, extracted image assets, quiz mode, and JSON export.
 - Deploys to Cloudflare Workers with `@opennextjs/cloudflare`.
 
@@ -41,6 +42,7 @@ Apply storage before deploy:
 
 ```bash
 npx wrangler d1 migrations apply filedrop --remote
+npx wrangler secret put ADMIN_TOKEN
 npm run deploy
 ```
 
@@ -52,10 +54,29 @@ Base URL:
 https://filedrop.mousab-r.workers.dev
 ```
 
+Admin dashboard:
+
+```text
+https://filedrop.mousab-r.workers.dev/admin
+```
+
+The admin page requires `ADMIN_TOKEN`. On this machine the deployed token is stored in:
+
+```text
+.filedrop-admin-token
+```
+
+Create a key in `/admin`; it returns a `fd_live_...` value one time. Use that key from your app:
+
+```text
+Authorization: Bearer fd_live_...
+```
+
 Create a processing job:
 
 ```bash
 curl -X POST "$BASE/api/jobs" \
+  -H "Authorization: Bearer $FILEDROP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"filename":"book.pdf","fileSize":12345,"contentType":"application/pdf"}'
 ```
@@ -64,6 +85,7 @@ Upload the original file for durable tracking:
 
 ```bash
 curl -X PUT "$BASE/api/jobs/$JOB_ID/source" \
+  -H "Authorization: Bearer $FILEDROP_API_KEY" \
   -H "Content-Type: application/pdf" \
   --data-binary @book.pdf
 ```
@@ -72,6 +94,7 @@ Save extracted output:
 
 ```bash
 curl -X PUT "$BASE/api/jobs/$JOB_ID/result" \
+  -H "Authorization: Bearer $FILEDROP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "status":"completed",
@@ -95,12 +118,30 @@ Text-only OpenRouter transforms for RAG/book workflows:
 
 ```bash
 curl -X POST "$BASE/api/transform" \
+  -H "Authorization: Bearer $FILEDROP_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"mode":"high_yield","text":"...extracted markdown..."}'
 ```
 
 Supported modes: `rag_markdown`, `chapter_summary`, `high_yield`, `table_to_markdown`, `qa`.
 These endpoints do not send page images. Vision remains disabled by default.
+
+## Usage tracking
+
+Usage is stored in D1:
+
+- `api_keys`: key name, prefix, status, created time, last used time.
+- `api_usage_events`: endpoint, method, status code, duration, request/response size, job ID, OpenRouter cost.
+- `processing_jobs.api_key_id`: links uploaded files and results to the client key.
+
+Admin endpoints:
+
+```bash
+curl "$BASE/api/admin/api-keys" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl "$BASE/api/admin/usage" -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+`REQUIRE_API_KEY=false` keeps the browser dropzone working without a key while still tracking any request that sends a key. Set `REQUIRE_API_KEY=true` in Cloudflare when your app is ready to enforce auth.
 
 ## Verification
 

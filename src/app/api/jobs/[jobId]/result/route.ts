@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import {
+  authenticateApiKey,
+  estimateJsonBytes,
+  recordUsageEvent,
+  requestByteLength,
+  sumOpenRouterCost,
+} from "@/lib/server/api-auth";
 import { getBindings } from "@/lib/server/cloudflare-bindings";
 import {
   getJob,
@@ -38,11 +45,18 @@ type RouteContext = {
 };
 
 export async function GET(request: Request, context: RouteContext) {
+  const startedAt = Date.now();
   const { jobId } = await context.params;
   const format = new URL(request.url).searchParams.get("format");
 
   try {
     const { DB, FILES } = await getBindings();
+    const auth = await authenticateApiKey(request, DB);
+
+    if (auth instanceof NextResponse) {
+      return auth;
+    }
+
     const job = await getJob(DB, jobId);
 
     if (!job) {
@@ -65,6 +79,18 @@ export async function GET(request: Request, context: RouteContext) {
     object.writeHttpMetadata?.(headers);
     headers.set("cache-control", "private, max-age=60");
 
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId ?? job.api_key_id,
+      jobId,
+      route: "/api/jobs/:jobId/result",
+      method: "GET",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(request),
+      responseBytes: null,
+      meta: { authenticated: auth.authenticated, format: format ?? "json" },
+    });
+
     return new Response(object.body, { headers });
   } catch (error) {
     return NextResponse.json(
@@ -78,6 +104,7 @@ export async function GET(request: Request, context: RouteContext) {
 }
 
 export async function PUT(request: Request, context: RouteContext) {
+  const startedAt = Date.now();
   const { jobId } = await context.params;
   const parsed = resultSchema.safeParse(await request.json());
 
@@ -90,6 +117,12 @@ export async function PUT(request: Request, context: RouteContext) {
 
   try {
     const { DB, FILES } = await getBindings();
+    const auth = await authenticateApiKey(request, DB);
+
+    if (auth instanceof NextResponse) {
+      return auth;
+    }
+
     const job = await getJob(DB, jobId);
 
     if (!job) {
@@ -189,13 +222,32 @@ export async function PUT(request: Request, context: RouteContext) {
       }).catch(() => null);
     }
 
-    return NextResponse.json({
+    const payload = {
       jobId,
       status: parsed.data.status,
       resultUrl: `/api/jobs/${jobId}/result`,
       markdownUrl: markdownKey ? `/api/jobs/${jobId}/result?format=markdown` : null,
       assets: storedAssets,
+    };
+
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId ?? job.api_key_id,
+      jobId,
+      route: "/api/jobs/:jobId/result",
+      method: "PUT",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(request),
+      responseBytes: estimateJsonBytes(payload),
+      openrouterCost: sumOpenRouterCost(parsed.data.usage),
+      meta: {
+        authenticated: auth.authenticated,
+        status: parsed.data.status,
+        assetCount: storedAssets.length,
+      },
     });
+
+    return NextResponse.json(payload);
   } catch (error) {
     return NextResponse.json(
       {

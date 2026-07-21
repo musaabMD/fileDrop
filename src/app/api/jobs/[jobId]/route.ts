@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import {
+  authenticateApiKey,
+  estimateJsonBytes,
+  recordUsageEvent,
+  requestByteLength,
+  sumOpenRouterCost,
+} from "@/lib/server/api-auth";
 import { getBindings } from "@/lib/server/cloudflare-bindings";
 import {
   getJob,
@@ -24,10 +31,17 @@ type RouteContext = {
 };
 
 export async function GET(_request: Request, context: RouteContext) {
+  const startedAt = Date.now();
   const { jobId } = await context.params;
 
   try {
     const { DB } = await getBindings();
+    const auth = await authenticateApiKey(_request, DB);
+
+    if (auth instanceof NextResponse) {
+      return auth;
+    }
+
     const job = await getJob(DB, jobId);
 
     if (!job) {
@@ -36,7 +50,7 @@ export async function GET(_request: Request, context: RouteContext) {
 
     const assets = await listJobAssets(DB, jobId);
 
-    return NextResponse.json({
+    const payload = {
       job: {
         id: job.id,
         filename: job.source_filename,
@@ -66,7 +80,22 @@ export async function GET(_request: Request, context: RouteContext) {
         url: publicAssetUrl(job.id, asset.id),
         createdAt: asset.created_at,
       })),
+    };
+
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId,
+      jobId,
+      route: "/api/jobs/:jobId",
+      method: "GET",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(_request),
+      responseBytes: estimateJsonBytes(payload),
+      openrouterCost: sumOpenRouterCost(payload.job.usage),
+      meta: { authenticated: auth.authenticated },
     });
+
+    return NextResponse.json(payload);
   } catch (error) {
     return NextResponse.json(
       {
@@ -79,6 +108,7 @@ export async function GET(_request: Request, context: RouteContext) {
 }
 
 export async function PATCH(request: Request, context: RouteContext) {
+  const startedAt = Date.now();
   const { jobId } = await context.params;
   const parsed = updateJobSchema.safeParse(await request.json());
 
@@ -91,6 +121,12 @@ export async function PATCH(request: Request, context: RouteContext) {
 
   try {
     const { DB } = await getBindings();
+    const auth = await authenticateApiKey(request, DB);
+
+    if (auth instanceof NextResponse) {
+      return auth;
+    }
+
     const existing = await getJob(DB, jobId);
 
     if (!existing) {
@@ -123,7 +159,21 @@ export async function PATCH(request: Request, context: RouteContext) {
       )
       .run();
 
-    return NextResponse.json({ jobId, status, updatedAt: timestamp });
+    const payload = { jobId, status, updatedAt: timestamp };
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId ?? existing.api_key_id,
+      jobId,
+      route: "/api/jobs/:jobId",
+      method: "PATCH",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(request),
+      responseBytes: estimateJsonBytes(payload),
+      openrouterCost: sumOpenRouterCost(parsed.data.usage),
+      meta: { authenticated: auth.authenticated },
+    });
+
+    return NextResponse.json(payload);
   } catch (error) {
     return NextResponse.json(
       {

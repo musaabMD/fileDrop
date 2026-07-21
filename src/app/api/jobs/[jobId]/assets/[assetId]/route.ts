@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { authenticateApiKey, recordUsageEvent, requestByteLength } from "@/lib/server/api-auth";
 import { getBindings } from "@/lib/server/cloudflare-bindings";
 import { getJob, publicAssetUrl } from "@/lib/server/jobs";
 
@@ -7,10 +8,17 @@ type RouteContext = {
 };
 
 export async function GET(_request: Request, context: RouteContext) {
+  const startedAt = Date.now();
   const { jobId, assetId } = await context.params;
 
   try {
     const { DB, FILES } = await getBindings();
+    const auth = await authenticateApiKey(_request, DB);
+
+    if (auth instanceof NextResponse) {
+      return auth;
+    }
+
     const job = await getJob(DB, jobId);
 
     if (!job) {
@@ -38,6 +46,18 @@ export async function GET(_request: Request, context: RouteContext) {
     headers.set("content-type", headers.get("content-type") ?? asset.content_type);
     headers.set("cache-control", "private, max-age=3600");
     headers.set("link", `<${publicAssetUrl(jobId, assetId)}>; rel="self"`);
+
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId ?? job.api_key_id,
+      jobId,
+      route: "/api/jobs/:jobId/assets/:assetId",
+      method: "GET",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(_request),
+      responseBytes: null,
+      meta: { authenticated: auth.authenticated, assetId },
+    });
 
     return new Response(object.body, { headers });
   } catch (error) {

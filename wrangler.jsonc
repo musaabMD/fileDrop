@@ -37,6 +37,7 @@
     "MAX_VISION_PAGES_PER_RUN": "3",
     "ENABLE_AI_CLEANUP": "true",
     "MAX_AI_CLEANUP_QUESTIONS_PER_RUN": "20",
-    "MAX_AI_TEXT_CHARS": "60000"
+    "MAX_AI_TEXT_CHARS": "60000",
+    "REQUIRE_API_KEY": "false"
   }
 }

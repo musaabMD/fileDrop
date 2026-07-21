@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import {
+  authenticateApiKey,
+  estimateJsonBytes,
+  recordUsageEvent,
+  requestByteLength,
+} from "@/lib/server/api-auth";
+import { getBindings } from "@/lib/server/cloudflare-bindings";
 
 const transformSchema = z.object({
   mode: z.enum(["rag_markdown", "chapter_summary", "high_yield", "table_to_markdown", "qa"]),
@@ -62,6 +69,14 @@ Return JSON only:
 }
 
 export async function POST(request: Request) {
+  const startedAt = Date.now();
+  const { DB } = await getBindings();
+  const auth = await authenticateApiKey(request, DB);
+
+  if (auth instanceof NextResponse) {
+    return auth;
+  }
+
   const parsed = transformSchema.safeParse(await request.json());
 
   if (!parsed.success) {
@@ -112,14 +127,33 @@ export async function POST(request: Request) {
     const usage = payload.usage ?? null;
     const cost = readUsageCost(usage);
 
-    return NextResponse.json({
+    const responsePayload = {
       mode: parsed.data.mode,
       model: payload.model ?? config.model,
       output,
       usage,
       cost,
       truncated: parsed.data.text.length > text.length,
+    };
+
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId,
+      route: "/api/transform",
+      method: "POST",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(request),
+      responseBytes: estimateJsonBytes(responsePayload),
+      openrouterCost: cost,
+      meta: {
+        authenticated: auth.authenticated,
+        mode: parsed.data.mode,
+        model: payload.model ?? config.model,
+        truncated: parsed.data.text.length > text.length,
+      },
     });
+
+    return NextResponse.json(responsePayload);
   } catch (error) {
     return NextResponse.json(
       {

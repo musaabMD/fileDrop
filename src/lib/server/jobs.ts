@@ -25,6 +25,7 @@ export type ProcessingJobRow = {
   usage_json: string | null;
   stats_json: string | null;
   callback_url: string | null;
+  api_key_id: string | null;
 };
 
 export type JobAssetRow = {

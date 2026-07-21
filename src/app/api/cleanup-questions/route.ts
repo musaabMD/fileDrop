@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import {
+  authenticateApiKey,
+  estimateJsonBytes,
+  recordUsageEvent,
+  requestByteLength,
+} from "@/lib/server/api-auth";
+import { getBindings } from "@/lib/server/cloudflare-bindings";
 
 const cleanupQuestionSchema = z.object({
   id: z.string().min(1),
@@ -94,6 +101,14 @@ Return:
 }
 
 export async function POST(request: Request) {
+  const startedAt = Date.now();
+  const { DB } = await getBindings();
+  const auth = await authenticateApiKey(request, DB);
+
+  if (auth instanceof NextResponse) {
+    return auth;
+  }
+
   const parsed = requestSchema.safeParse(await request.json());
 
   if (!parsed.success) {
@@ -155,12 +170,30 @@ export async function POST(request: Request) {
 
       const cleaned = cleanupResponseSchema.parse(JSON.parse(stripJsonFence(content)));
       const usage = payload.usage ?? null;
-      return NextResponse.json({
+      const responsePayload = {
         ...cleaned,
         model: payload.model ?? config.model,
         usage,
         cost: readUsageCost(usage),
+      };
+
+      await recordUsageEvent(DB, {
+        apiKeyId: auth.apiKeyId,
+        route: "/api/cleanup-questions",
+        method: "POST",
+        statusCode: 200,
+        durationMs: Date.now() - startedAt,
+        requestBytes: requestByteLength(request),
+        responseBytes: estimateJsonBytes(responsePayload),
+        openrouterCost: responsePayload.cost,
+        meta: {
+          authenticated: auth.authenticated,
+          model: payload.model ?? config.model,
+          questions: questions.length,
+        },
       });
+
+      return NextResponse.json(responsePayload);
     } finally {
       clearTimeout(timeout);
     }

@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import {
+  authenticateApiKey,
+  estimateJsonBytes,
+  recordUsageEvent,
+  requestByteLength,
+} from "@/lib/server/api-auth";
 import { getBindings } from "@/lib/server/cloudflare-bindings";
 import { nowIso, publicResultUrl, publicStatusUrl } from "@/lib/server/jobs";
 
@@ -12,6 +18,7 @@ const createJobSchema = z.object({
 });
 
 export async function POST(request: Request) {
+  const startedAt = Date.now();
   const parsed = createJobSchema.safeParse(await request.json());
 
   if (!parsed.success) {
@@ -23,14 +30,20 @@ export async function POST(request: Request) {
 
   try {
     const { DB } = await getBindings();
+    const auth = await authenticateApiKey(request, DB);
+
+    if (auth instanceof NextResponse) {
+      return auth;
+    }
+
     const jobId = crypto.randomUUID();
     const timestamp = nowIso();
 
     await DB.prepare(
       `INSERT INTO processing_jobs (
         id, source_filename, source_content_type, status, file_size, page_count,
-        progress, started_at, updated_at, callback_url
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        progress, started_at, updated_at, callback_url, api_key_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         jobId,
@@ -43,18 +56,30 @@ export async function POST(request: Request) {
         timestamp,
         timestamp,
         parsed.data.callbackUrl ?? null,
+        auth.apiKeyId,
       )
       .run();
 
-    return NextResponse.json(
-      {
-        jobId,
-        status: "created",
-        statusUrl: publicStatusUrl(jobId),
-        resultUrl: publicResultUrl(jobId),
-      },
-      { status: 201 },
-    );
+    const payload = {
+      jobId,
+      status: "created",
+      statusUrl: publicStatusUrl(jobId),
+      resultUrl: publicResultUrl(jobId),
+    };
+
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId,
+      jobId,
+      route: "/api/jobs",
+      method: "POST",
+      statusCode: 201,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(request),
+      responseBytes: estimateJsonBytes(payload),
+      meta: { authenticated: auth.authenticated },
+    });
+
+    return NextResponse.json(payload, { status: 201 });
   } catch (error) {
     return NextResponse.json(
       {

@@ -1,4 +1,10 @@
 import { NextResponse } from "next/server";
+import {
+  authenticateApiKey,
+  estimateJsonBytes,
+  recordUsageEvent,
+  requestByteLength,
+} from "@/lib/server/api-auth";
 import { getBindings } from "@/lib/server/cloudflare-bindings";
 import { getJob, jobSourceKey, nowIso } from "@/lib/server/jobs";
 
@@ -7,10 +13,17 @@ type RouteContext = {
 };
 
 export async function PUT(request: Request, context: RouteContext) {
+  const startedAt = Date.now();
   const { jobId } = await context.params;
 
   try {
     const { DB, FILES } = await getBindings();
+    const auth = await authenticateApiKey(request, DB);
+
+    if (auth instanceof NextResponse) {
+      return auth;
+    }
+
     const job = await getJob(DB, jobId);
 
     if (!job) {
@@ -31,7 +44,20 @@ export async function PUT(request: Request, context: RouteContext) {
       .bind(key, contentType, body.byteLength, "uploaded", Math.max(job.progress, 5), timestamp, jobId)
       .run();
 
-    return NextResponse.json({ jobId, status: "uploaded", sourceKey: key, bytes: body.byteLength });
+    const payload = { jobId, status: "uploaded", sourceKey: key, bytes: body.byteLength };
+    await recordUsageEvent(DB, {
+      apiKeyId: auth.apiKeyId ?? job.api_key_id,
+      jobId,
+      route: "/api/jobs/:jobId/source",
+      method: "PUT",
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+      requestBytes: requestByteLength(request) ?? body.byteLength,
+      responseBytes: estimateJsonBytes(payload),
+      meta: { authenticated: auth.authenticated, contentType },
+    });
+
+    return NextResponse.json(payload);
   } catch (error) {
     return NextResponse.json(
       {
