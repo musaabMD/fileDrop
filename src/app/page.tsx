@@ -132,9 +132,17 @@ async function renderPdfPages(
 
     const textContent = await page.getTextContent();
     const nativeText = textContent.items
-      .map((item) => ("str" in item ? item.str : ""))
-      .filter(Boolean)
-      .join(" ");
+      .map((item) => {
+        if (!("str" in item)) {
+          return "";
+        }
+
+        return `${item.str}${"hasEOL" in item && item.hasEOL ? "\n" : " "}`;
+      })
+      .join("")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
 
     await onPage({
       pageNumber,
@@ -204,7 +212,12 @@ function questionsToMarkdown(fileName: string, questions: CanonicalQuestion[]) {
 }
 
 function extractNativeTextPage(page: PageWork): PageExtraction {
-  const text = page.nativeText.replace(/\s+/g, " ").trim();
+  const text = page.nativeText
+    .split(/\n+/)
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
   const questionBlocks = splitQuestionBlocks(text);
   const questions = questionBlocks
     .map((block, index) => buildNativeQuestion(block, page, index))
@@ -246,6 +259,20 @@ function splitQuestionBlocks(text: string) {
     return [];
   }
 
+  const paragraphBlocks = text
+    .split(/\n\s*\n+/)
+    .map((block) => block.trim())
+    .filter((block) => block.split(/\n/).filter(Boolean).length >= 3);
+
+  if (paragraphBlocks.length > 1) {
+    return paragraphBlocks;
+  }
+
+  const lineBlocks = splitRecallLines(text);
+  if (lineBlocks.length > 1) {
+    return lineBlocks;
+  }
+
   const starts = Array.from(text.matchAll(/(?:^|\s)(?:Q(?:uestion)?\s*)?\d{1,3}[\).:-]\s+/gi))
     .map((match) => match.index ?? 0)
     .filter((index, position, array) => position === 0 || index !== array[position - 1]);
@@ -257,6 +284,46 @@ function splitQuestionBlocks(text: string) {
   return starts.map((start, index) => text.slice(start, starts[index + 1] ?? text.length).trim());
 }
 
+function splitRecallLines(text: string) {
+  const lines = text
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter((line) => !isHeaderOrComment(line));
+  const blocks: string[][] = [];
+  let current: string[] = [];
+
+  for (const line of lines) {
+    if (startsNewRecallBlock(line, current)) {
+      blocks.push(current);
+      current = [line];
+    } else {
+      current.push(line);
+    }
+  }
+
+  if (current.length) {
+    blocks.push(current);
+  }
+
+  return blocks
+    .map((block) => block.join("\n"))
+    .filter((block) => block.split(/\n/).length >= 3);
+}
+
+function startsNewRecallBlock(line: string, current: string[]) {
+  if (current.length < 3 || isHeaderOrComment(line)) {
+    return false;
+  }
+
+  const trailingChoices = collectTrailingChoices(current);
+  if (trailingChoices.length < 2) {
+    return false;
+  }
+
+  return looksLikeQuestionStartLine(line) || !looksLikeChoiceLine(line);
+}
+
 function buildNativeQuestion(
   block: string,
   page: PageWork,
@@ -266,10 +333,19 @@ function buildNativeQuestion(
     block.matchAll(/(?:^|\s)([A-H])[\).:-]\s*([^A-H]{1,240}?)(?=\s+[A-H][\).:-]|\s+(?:Answer|Ans)\b|$)/gi),
   );
 
-  if (choiceMatches.length < 2) {
-    return null;
+  if (choiceMatches.length >= 2) {
+    return buildLabeledQuestion(block, page, questionIndex, choiceMatches);
   }
 
+  return buildRecallStyleQuestion(block, page, questionIndex);
+}
+
+function buildLabeledQuestion(
+  block: string,
+  page: PageWork,
+  questionIndex: number,
+  choiceMatches: RegExpMatchArray[],
+): CanonicalQuestion | null {
   const firstChoiceIndex = choiceMatches[0]?.index ?? -1;
   const stem = block
     .slice(0, firstChoiceIndex > 0 ? firstChoiceIndex : undefined)
@@ -290,8 +366,156 @@ function buildNativeQuestion(
   }));
   const answerMatch = block.match(/\b(?:Answer|Ans)\s*[:\-]?\s*([A-H])\b/i);
   const answerLabel = answerMatch?.[1]?.toUpperCase() ?? null;
+
+  return createNativeQuestion({
+    page,
+    questionIndex,
+    stem,
+    choices,
+    answerLabel,
+    answerRawText: answerMatch?.[0] ?? null,
+    confidence: answerLabel ? 0.82 : 0.72,
+  });
+}
+
+function buildRecallStyleQuestion(
+  block: string,
+  page: PageWork,
+  questionIndex: number,
+): CanonicalQuestion | null {
+  const lines = block
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter((line) => !isHeaderOrComment(line));
+
+  if (lines.length < 3) {
+    return null;
+  }
+
+  const questionEnd = lines.findIndex((line) => line.includes("?"));
+  let stemLines: string[];
+  let choiceLines: string[];
+
+  if (questionEnd >= 0 && lines.length - questionEnd - 1 >= 2) {
+    stemLines = lines.slice(0, questionEnd + 1);
+    choiceLines = lines.slice(questionEnd + 1);
+  } else {
+    const trailingChoices = collectTrailingChoices(lines);
+    if (trailingChoices.length < 2 || trailingChoices.length >= lines.length) {
+      return null;
+    }
+
+    stemLines = lines.slice(0, lines.length - trailingChoices.length);
+    choiceLines = trailingChoices;
+  }
+
+  choiceLines = choiceLines
+    .map((line) => line.replace(/^[-*•]\s*/, "").trim())
+    .filter((line) => line && !isHeaderOrComment(line))
+    .slice(0, 6);
+
+  if (choiceLines.length < 2 || !stemLines.join(" ").trim()) {
+    return null;
+  }
+
+  const choices = choiceLines.map((line, index) => ({
+    id: `p${page.pageNumber}_q${questionIndex + 1}_c${index + 1}`,
+    label: String.fromCharCode(65 + index),
+    text: line,
+    orderIndex: index,
+    boundingBox: null,
+  }));
+
+  return createNativeQuestion({
+    page,
+    questionIndex,
+    stem: stemLines.join(" ").replace(/^(?:Q(?:uestion)?\s*)?\d{1,4}[\).:-]\s*/i, "").trim(),
+    choices,
+    answerLabel: null,
+    answerRawText: null,
+    confidence: 0.68,
+  });
+}
+
+function collectTrailingChoices(lines: string[]) {
+  const choices: string[] = [];
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line || isHeaderOrComment(line) || looksLikeQuestionLine(line)) {
+      break;
+    }
+
+    if (looksLikeChoiceLine(line)) {
+      choices.unshift(line);
+    } else {
+      break;
+    }
+  }
+
+  return choices.slice(-6);
+}
+
+function looksLikeChoiceLine(line: string) {
+  const wordCount = line.split(/\s+/).length;
+  return line.length <= 90 && wordCount <= 10 && !/^(and|or|but)\b/i.test(line);
+}
+
+function looksLikeQuestionLine(line: string) {
+  return (
+    line.includes("?") ||
+    /\b(what|which|best|most likely|diagnosis|management|treatment|next step|initial|confirm|responsible)\b/i.test(line)
+  );
+}
+
+function looksLikeQuestionStartLine(line: string) {
+  return (
+    /^(?:\d{1,4}[\).:-]\s*)?(?:a|an|the)?\s*(patient|woman|man|male|female|child|boy|girl|newborn|infant|pregnant|question|pt)\b/i.test(line) ||
+    /\b(presents?|came|coming|history|diagnosed|scheduled|asking|what|which|best|most likely)\b/i.test(line)
+  );
+}
+
+function isHeaderOrComment(line: string) {
+  return (
+    /^April 15 2026 SMLE Morning Exam$/i.test(line) ||
+    /^Tried to remember/i.test(line) ||
+    /^The missing questions/i.test(line) ||
+    /^Wish you all/i.test(line) ||
+    /^Alhomrani:/i.test(line)
+  );
+}
+
+function createNativeQuestion({
+  page,
+  questionIndex,
+  stem,
+  choices,
+  answerLabel,
+  answerRawText,
+  confidence,
+}: {
+  page: PageWork;
+  questionIndex: number;
+  stem: string;
+  choices: CanonicalQuestion["versions"]["quizReady"]["choices"];
+  answerLabel: string | null;
+  answerRawText: string | null;
+  confidence: number;
+}): CanonicalQuestion | null {
+  if (!stem || choices.length < 2) {
+    return null;
+  }
+
+  const questionId = `p${page.pageNumber}_q${questionIndex + 1}`;
+  const normalizedChoices = choices.map((choice, index) => ({
+    ...choice,
+    id: choice.id || `${questionId}_c${index + 1}`,
+    label: choice.label ?? String.fromCharCode(65 + index),
+    orderIndex: index,
+  }));
   const correctChoice = answerLabel
-    ? choices.find((choice) => choice.label === answerLabel)
+    ? normalizedChoices.find((choice) => choice.label === answerLabel)
     : null;
 
   return {
@@ -303,15 +527,15 @@ function buildNativeQuestion(
       evidenceIds: [],
     },
     versions: {
-      source: { stem, choices },
-      normalized: { stem, choices },
-      quizReady: { stem, choices },
+      source: { stem, choices: normalizedChoices },
+      normalized: { stem, choices: normalizedChoices },
+      quizReady: { stem, choices: normalizedChoices },
     },
     answer: {
       correctChoiceId: correctChoice?.id ?? null,
       sourceChoiceLabel: answerLabel,
       status: answerLabel ? "explicit" : "missing",
-      rawAnswerText: answerMatch?.[0] ?? null,
+      rawAnswerText: answerRawText,
       evidenceIds: [],
       confidence: answerLabel ? 0.7 : 0,
     },
@@ -325,17 +549,17 @@ function buildNativeQuestion(
       answerPresent: Boolean(answerLabel),
       hasConflictingEvidence: false,
       missingParts: answerLabel ? [] : ["answer"],
-      score: answerLabel ? 0.82 : 0.7,
+      score: confidence,
     },
     usabilityStatus: answerLabel ? "quiz_ready" : "needs_review",
     confidence: {
-      segmentation: 0.75,
-      stem: 0.8,
-      choices: 0.82,
+      segmentation: confidence,
+      stem: confidence,
+      choices: confidence,
       answer: answerLabel ? 0.7 : 0,
       imageAssociation: 1,
       duplicateResolution: 1,
-      overall: answerLabel ? 0.82 : 0.72,
+      overall: confidence,
     },
     warnings: [],
     reviewStatus: "review_required",
