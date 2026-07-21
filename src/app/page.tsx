@@ -5,6 +5,7 @@
 import {
   Check,
   Download,
+  FileText,
   FileUp,
   Loader2,
   RotateCcw,
@@ -20,7 +21,7 @@ import type {
 } from "@/lib/extraction-schema";
 
 type Phase = "idle" | "rendering" | "extracting" | "done" | "error";
-type Tab = "review" | "assets" | "quiz" | "json";
+type Tab = "review" | "markdown" | "assets" | "quiz" | "json";
 
 type PageWork = {
   pageNumber: number;
@@ -36,6 +37,11 @@ type LocalAsset = QuestionAsset & {
 };
 
 type QuizAnswer = Record<string, string>;
+type MarkdownPage = {
+  pageNumber: number;
+  source: "native" | "ocr" | "empty";
+  text: string;
+};
 
 const MAX_RENDER_WIDTH = 1050;
 const IMAGE_QUALITY = 0.62;
@@ -153,6 +159,48 @@ async function extractPage(fileName: string, page: PageWork) {
   }
 
   return (await response.json()) as PageExtraction;
+}
+
+async function ocrPage(imageDataUrl: string) {
+  const { recognize } = await import("tesseract.js");
+  const result = await recognize(imageDataUrl, "eng+ara");
+  return result.data.text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function pageToMarkdown(page: MarkdownPage) {
+  const sourceLabel =
+    page.source === "native"
+      ? "native PDF text"
+      : page.source === "ocr"
+        ? "local OCR"
+        : "no text";
+
+  return [`## Page ${page.pageNumber}`, ``, `Source: ${sourceLabel}`, ``, page.text || "_No text extracted._"].join("\n");
+}
+
+function questionsToMarkdown(fileName: string, questions: CanonicalQuestion[]) {
+  const lines = [`# ${fileName || "fileDrop extraction"}`, ""];
+
+  if (!questions.length) {
+    lines.push("_No MCQs extracted from selectable text._");
+    return lines.join("\n");
+  }
+
+  questions.forEach((question, index) => {
+    lines.push(`## Question ${index + 1}`, "");
+    lines.push(question.versions.quizReady.stem, "");
+    question.versions.quizReady.choices.forEach((choice) => {
+      lines.push(`${choice.label ?? choice.orderIndex + 1}. ${choice.text}`);
+    });
+    lines.push("");
+    lines.push(`Answer status: ${question.answer.status}`);
+    if (question.answer.sourceChoiceLabel) {
+      lines.push(`Answer: ${question.answer.sourceChoiceLabel}`);
+    }
+    lines.push(`Pages: ${question.source.pageNumbers.join(", ")}`, "");
+  });
+
+  return lines.join("\n");
 }
 
 function extractNativeTextPage(page: PageWork): PageExtraction {
@@ -307,6 +355,8 @@ export default function Home() {
   const [quizAnswers, setQuizAnswers] = useState<QuizAnswer>({});
   const [submitted, setSubmitted] = useState(false);
   const [useVision, setUseVision] = useState(false);
+  const [useOcr, setUseOcr] = useState(false);
+  const [markdownPages, setMarkdownPages] = useState<MarkdownPage[]>([]);
 
   const approvedQuestions = useMemo(
     () =>
@@ -342,6 +392,7 @@ export default function Home() {
     setQuestions([]);
     setAssets([]);
     setWarnings([]);
+    setMarkdownPages([]);
     setQuizAnswers({});
     setSubmitted(false);
     setError("");
@@ -350,6 +401,7 @@ export default function Home() {
       const nextQuestions: CanonicalQuestion[] = [];
       const nextAssets: LocalAsset[] = [];
       const nextWarnings: string[] = [];
+      const nextMarkdownPages: MarkdownPage[] = [];
 
       setPhase("rendering");
       await renderPdfPages(file, (current, total, label) => {
@@ -363,9 +415,38 @@ export default function Home() {
         });
 
         try {
-          const nativeResult = extractNativeTextPage(page);
+          let pageForExtraction = page;
+          const hasEnoughNativeText = page.nativeText.replace(/\s+/g, "").length >= 40;
+
+          if (useOcr && !hasEnoughNativeText) {
+            setProgress({
+              current: page.pageNumber,
+              total,
+              label: "running local OCR",
+            });
+            const ocrText = await ocrPage(page.imageDataUrl);
+            pageForExtraction = {
+              ...page,
+              nativeText: ocrText,
+            };
+            nextMarkdownPages.push({
+              pageNumber: page.pageNumber,
+              source: ocrText ? "ocr" : "empty",
+              text: ocrText,
+            });
+          } else {
+            nextMarkdownPages.push({
+              pageNumber: page.pageNumber,
+              source: page.nativeText.trim() ? "native" : "empty",
+              text: page.nativeText.trim(),
+            });
+          }
+
+          setMarkdownPages([...nextMarkdownPages]);
+
+          const nativeResult = extractNativeTextPage(pageForExtraction);
           const needsVision = useVision && nativeResult.questions.length === 0 && page.pageNumber <= MAX_VISION_PAGES;
-          const result = needsVision ? await extractPage(file.name, page) : nativeResult;
+          const result = needsVision ? await extractPage(file.name, pageForExtraction) : nativeResult;
           nextQuestions.push(...result.questions);
           nextWarnings.push(...result.warnings.map((warning) => `Page ${page.pageNumber}: ${warning}`));
 
@@ -514,6 +595,7 @@ export default function Home() {
                   setQuestions([]);
                   setAssets([]);
                   setWarnings([]);
+                  setMarkdownPages([]);
                   setProgress({ current: 0, total: 0, label: "" });
                   setError("");
                 }}
@@ -544,6 +626,23 @@ export default function Home() {
                 <dd className="mt-1 font-medium">{assets.length}</dd>
               </div>
             </dl>
+            <label className="mt-4 flex items-start gap-3 rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm">
+              <input
+                type="checkbox"
+                checked={useOcr}
+                onChange={(event) => setUseOcr(event.target.checked)}
+                className="mt-1"
+              />
+              <span>
+                <span className="block font-medium text-zinc-800">
+                  Local OCR for scanned pages
+                </span>
+                <span className="mt-1 block text-xs leading-5 text-zinc-500">
+                  Runs in this browser with Tesseract. No OpenRouter call. Slower
+                  on image-only pages.
+                </span>
+              </span>
+            </label>
             <label className="mt-4 flex items-start gap-3 rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm">
               <input
                 type="checkbox"
@@ -582,7 +681,7 @@ export default function Home() {
         </section>
 
         <nav className="flex flex-wrap gap-2">
-          {(["review", "assets", "quiz", "json"] as const).map((item) => (
+          {(["review", "markdown", "assets", "quiz", "json"] as const).map((item) => (
             <button
               key={item}
               type="button"
@@ -715,6 +814,51 @@ export default function Home() {
             ) : (
               <EmptyState label="No extracted questions yet." />
             )}
+          </section>
+        ) : null}
+
+        {tab === "markdown" ? (
+          <section className="grid gap-4">
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  const markdown = [
+                    questionsToMarkdown(fileName, questions),
+                    "",
+                    "---",
+                    "",
+                    "# Page Text",
+                    "",
+                    ...markdownPages.map(pageToMarkdown),
+                  ].join("\n");
+                  const url = URL.createObjectURL(
+                    new Blob([markdown], { type: "text/markdown" }),
+                  );
+                  const anchor = document.createElement("a");
+                  anchor.href = url;
+                  anchor.download = `${fileName || "filedrop"}-extraction.md`;
+                  anchor.click();
+                  URL.revokeObjectURL(url);
+                }}
+                disabled={!questions.length && !markdownPages.length}
+                className="inline-flex items-center gap-2 rounded-md bg-zinc-950 px-3 py-2 text-sm font-medium text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <FileText className="h-4 w-4" />
+                Download Markdown
+              </button>
+            </div>
+            <pre className="max-h-[720px] overflow-auto rounded-lg border border-zinc-200 bg-white p-4 text-sm leading-6 text-zinc-800 shadow-sm whitespace-pre-wrap">
+              {[
+                questionsToMarkdown(fileName, questions),
+                "",
+                "---",
+                "",
+                "# Page Text",
+                "",
+                ...markdownPages.map(pageToMarkdown),
+              ].join("\n")}
+            </pre>
           </section>
         ) : null}
 
