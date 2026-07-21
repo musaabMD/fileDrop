@@ -39,6 +39,7 @@ type QuizAnswer = Record<string, string>;
 
 const MAX_RENDER_WIDTH = 1050;
 const IMAGE_QUALITY = 0.62;
+const MAX_VISION_PAGES = 3;
 
 function statusTone(status: CanonicalQuestion["usabilityStatus"]) {
   if (status === "quiz_ready") return "bg-emerald-50 text-emerald-700 ring-emerald-200";
@@ -154,6 +155,145 @@ async function extractPage(fileName: string, page: PageWork) {
   return (await response.json()) as PageExtraction;
 }
 
+function extractNativeTextPage(page: PageWork): PageExtraction {
+  const text = page.nativeText.replace(/\s+/g, " ").trim();
+  const questionBlocks = splitQuestionBlocks(text);
+  const questions = questionBlocks
+    .map((block, index) => buildNativeQuestion(block, page, index))
+    .filter((question): question is CanonicalQuestion => Boolean(question));
+
+  return {
+    schemaVersion: "1.0",
+    page: {
+      pageNumber: page.pageNumber,
+      width: page.width,
+      height: page.height,
+      extractedText: text || null,
+    },
+    regions: text
+      ? [
+          {
+            id: `p${page.pageNumber}_native_text`,
+            type: questions.length ? "question_stem" : "non_question_content",
+            rawText: text,
+            normalizedText: text,
+            boundingBox: { x: 0, y: 0, width: page.width, height: page.height },
+            confidence: questions.length ? 0.72 : 0.35,
+            associatedQuestionId: questions[0]?.id ?? null,
+          },
+        ]
+      : [],
+    assets: [],
+    questions,
+    warnings: questions.length
+      ? []
+      : text
+        ? ["No clear text MCQ pattern found. Vision mode is off to prevent cost."]
+        : ["No selectable text found. Vision mode is off to prevent cost."],
+  };
+}
+
+function splitQuestionBlocks(text: string) {
+  if (!text) {
+    return [];
+  }
+
+  const starts = Array.from(text.matchAll(/(?:^|\s)(?:Q(?:uestion)?\s*)?\d{1,3}[\).:-]\s+/gi))
+    .map((match) => match.index ?? 0)
+    .filter((index, position, array) => position === 0 || index !== array[position - 1]);
+
+  if (starts.length <= 1) {
+    return [text];
+  }
+
+  return starts.map((start, index) => text.slice(start, starts[index + 1] ?? text.length).trim());
+}
+
+function buildNativeQuestion(
+  block: string,
+  page: PageWork,
+  questionIndex: number,
+): CanonicalQuestion | null {
+  const choiceMatches = Array.from(
+    block.matchAll(/(?:^|\s)([A-H])[\).:-]\s*([^A-H]{1,240}?)(?=\s+[A-H][\).:-]|\s+(?:Answer|Ans)\b|$)/gi),
+  );
+
+  if (choiceMatches.length < 2) {
+    return null;
+  }
+
+  const firstChoiceIndex = choiceMatches[0]?.index ?? -1;
+  const stem = block
+    .slice(0, firstChoiceIndex > 0 ? firstChoiceIndex : undefined)
+    .replace(/^(?:Q(?:uestion)?\s*)?\d{1,3}[\).:-]\s*/i, "")
+    .trim();
+
+  if (!stem) {
+    return null;
+  }
+
+  const questionId = `p${page.pageNumber}_q${questionIndex + 1}`;
+  const choices = choiceMatches.map((match, index) => ({
+    id: `${questionId}_c${index + 1}`,
+    label: match[1]?.toUpperCase() ?? null,
+    text: match[2]?.trim() || "Review choice",
+    orderIndex: index,
+    boundingBox: null,
+  }));
+  const answerMatch = block.match(/\b(?:Answer|Ans)\s*[:\-]?\s*([A-H])\b/i);
+  const answerLabel = answerMatch?.[1]?.toUpperCase() ?? null;
+  const correctChoice = answerLabel
+    ? choices.find((choice) => choice.label === answerLabel)
+    : null;
+
+  return {
+    id: questionId,
+    origin: "extracted",
+    source: {
+      pageNumbers: [page.pageNumber],
+      regionIds: [`p${page.pageNumber}_native_text`],
+      evidenceIds: [],
+    },
+    versions: {
+      source: { stem, choices },
+      normalized: { stem, choices },
+      quizReady: { stem, choices },
+    },
+    answer: {
+      correctChoiceId: correctChoice?.id ?? null,
+      sourceChoiceLabel: answerLabel,
+      status: answerLabel ? "explicit" : "missing",
+      rawAnswerText: answerMatch?.[0] ?? null,
+      evidenceIds: [],
+      confidence: answerLabel ? 0.7 : 0,
+    },
+    assets: [],
+    completeness: {
+      stemComplete: true,
+      choicesComplete: choices.length >= 2,
+      minimumChoiceCountMet: choices.length >= 2,
+      imageRequired: false,
+      imagePresentWhenRequired: true,
+      answerPresent: Boolean(answerLabel),
+      hasConflictingEvidence: false,
+      missingParts: answerLabel ? [] : ["answer"],
+      score: answerLabel ? 0.82 : 0.7,
+    },
+    usabilityStatus: answerLabel ? "quiz_ready" : "needs_review",
+    confidence: {
+      segmentation: 0.75,
+      stem: 0.8,
+      choices: 0.82,
+      answer: answerLabel ? 0.7 : 0,
+      imageAssociation: 1,
+      duplicateResolution: 1,
+      overall: answerLabel ? 0.82 : 0.72,
+    },
+    warnings: [],
+    reviewStatus: "review_required",
+  };
+}
+
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -166,6 +306,7 @@ export default function Home() {
   const [error, setError] = useState("");
   const [quizAnswers, setQuizAnswers] = useState<QuizAnswer>({});
   const [submitted, setSubmitted] = useState(false);
+  const [useVision, setUseVision] = useState(false);
 
   const approvedQuestions = useMemo(
     () =>
@@ -222,7 +363,9 @@ export default function Home() {
         });
 
         try {
-          const result = await extractPage(file.name, page);
+          const nativeResult = extractNativeTextPage(page);
+          const needsVision = useVision && nativeResult.questions.length === 0 && page.pageNumber <= MAX_VISION_PAGES;
+          const result = needsVision ? await extractPage(file.name, page) : nativeResult;
           nextQuestions.push(...result.questions);
           nextWarnings.push(...result.warnings.map((warning) => `Page ${page.pageNumber}: ${warning}`));
 
@@ -352,12 +495,12 @@ export default function Home() {
             <div>
               <h1 className="text-3xl font-semibold tracking-normal">fileDrop</h1>
               <p className="mt-2 max-w-xl text-sm leading-6 text-zinc-600">
-                Drop a PDF. Pages render locally, OpenRouter extracts questions, and
-                image regions are cropped back into review cards.
+                Drop a PDF. Text-based MCQs extract locally with no OpenRouter
+                calls. Vision is blocked unless you deliberately re-enable it.
               </p>
             </div>
             <span className="rounded-md bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-600">
-              PDF only
+              Free text mode
             </span>
           </button>
 
@@ -401,6 +544,24 @@ export default function Home() {
                 <dd className="mt-1 font-medium">{assets.length}</dd>
               </div>
             </dl>
+            <label className="mt-4 flex items-start gap-3 rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm">
+              <input
+                type="checkbox"
+                checked={useVision}
+                onChange={(event) => setUseVision(event.target.checked)}
+                className="mt-1"
+              />
+              <span>
+                <span className="block font-medium text-zinc-800">
+                  Vision fallback
+                </span>
+                <span className="mt-1 block text-xs leading-5 text-zinc-500">
+                  Server kill switch is off. Enable Cloudflare
+                  `ENABLE_VISION_EXTRACTION=true` only after setting an
+                  OpenRouter budget.
+                </span>
+              </span>
+            </label>
             {progress.label ? (
               <div className="mt-4">
                 <div className="h-2 overflow-hidden rounded-full bg-zinc-100">

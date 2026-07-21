@@ -12,6 +12,17 @@ const requestSchema = z.object({
 });
 
 export async function POST(request: Request) {
+  if (process.env.ENABLE_VISION_EXTRACTION !== "true") {
+    return NextResponse.json(
+      {
+        error: "Vision extraction is disabled.",
+        message:
+          "OpenRouter calls are blocked by ENABLE_VISION_EXTRACTION=false to prevent unexpected cost.",
+      },
+      { status: 403 },
+    );
+  }
+
   const parsed = requestSchema.safeParse(await request.json());
 
   if (!parsed.success) {
