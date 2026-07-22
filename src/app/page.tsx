@@ -759,6 +759,11 @@ function splitQuestionBlocks(text: string) {
     return [];
   }
 
+  const recallBlocks = splitRecallLines(text);
+  if (recallBlocks.length > 1) {
+    return recallBlocks;
+  }
+
   const paragraphBlocks = text
     .split(/\n\s*\n+/)
     .map((block) => block.trim())
@@ -766,11 +771,6 @@ function splitQuestionBlocks(text: string) {
 
   if (paragraphBlocks.length > 1) {
     return paragraphBlocks;
-  }
-
-  const lineBlocks = splitRecallLines(text);
-  if (lineBlocks.length > 1) {
-    return lineBlocks;
   }
 
   const starts = Array.from(text.matchAll(/(?:^|\s)(?:Q(?:uestion)?\s*)?\d{1,3}[\).:-]\s+/gi))
@@ -817,11 +817,12 @@ function startsNewRecallBlock(line: string, current: string[]) {
   }
 
   const trailingChoices = collectTrailingChoices(current);
+  const hasQuestionContext = current.some(looksLikeQuestionLine) || current.some(looksLikeQuestionStartLine);
   if (trailingChoices.length < 2) {
     return false;
   }
 
-  return looksLikeQuestionStartLine(line) || !looksLikeChoiceLine(line);
+  return hasQuestionContext && (looksLikeQuestionStartLine(line) || !looksLikeChoiceLine(line));
 }
 
 function buildNativeQuestion(
@@ -924,11 +925,11 @@ function buildRecallStyleQuestion(
     choiceLines = trailingChoices;
   }
 
-  choiceLines = choiceLines
+  choiceLines = trimDanglingTailChoices(choiceLines
     .map((line) => line.replace(/^[-*•]\s*/, "").trim())
     .map((line, index) => cleanChoiceText(line, String.fromCharCode(65 + index)))
     .filter((line) => line && !isHeaderOrComment(line) && !isAnswerLine(line) && !isCategoryChoice(line))
-    .slice(0, 6);
+    .slice(0, 6));
 
   if (choiceLines.length < 2 || !stemLines.join(" ").trim()) {
     return null;
@@ -957,6 +958,21 @@ function buildRecallStyleQuestion(
     answerUncertain: answerFromBlock.uncertain,
     confidence: answerFromBlock.label ? 0.76 : 0.68,
   });
+}
+
+function trimDanglingTailChoices(lines: string[]) {
+  if (lines.length <= 4) {
+    return lines;
+  }
+
+  const last = lines.at(-1)?.trim() ?? "";
+  const previousChoices = lines.slice(0, -1);
+  const looksLikePageBreakFragment =
+    previousChoices.length >= 4 &&
+    /^[A-Za-z]{3,18}$/.test(last) &&
+    !/\b(type|stage|grade|class|group)\b/i.test(last);
+
+  return looksLikePageBreakFragment ? previousChoices : lines;
 }
 
 function collectTrailingChoices(lines: string[]) {
@@ -992,7 +1008,7 @@ function looksLikeChoiceLine(line: string) {
 function looksLikeQuestionLine(line: string) {
   return (
     line.includes("?") ||
-    /\b(what|which|best|most likely|diagnosis|management|treatment|next step|initial|confirm|responsible)\b/i.test(line)
+    /\b(what|which|best|most likely|diagnosis|management|treatment|next step|initial|confirm|responsible|target|level|cause|add)\b/i.test(line)
   );
 }
 
@@ -1105,9 +1121,13 @@ function extractAnswerFromLines(lines: string[]) {
 }
 
 function looksLikeQuestionStartLine(line: string) {
+  const normalized = line.replace(/\s+/g, " ").trim();
+
   return (
-    /^(?:\d{1,4}[\).:-]\s*)?(?:a|an|the)?\s*(patient|woman|man|male|female|child|boy|girl|newborn|infant|pregnant|question|pt)\b/i.test(line) ||
-    /\b(presents?|came|coming|history|diagnosed|scheduled|asking|what|which|best|most likely)\b/i.test(line)
+    /^(?:\d{1,4}[\).:-]\s*)?(?:a|an|the)?\s*(patient|woman|man|male|female|child|boy|girl|newborn|infant|pregnant|question|pt)\b/i.test(normalized) ||
+    /^(?:\d{1,4}[\).:-]\s*)?\d{1,3}\s*(?:yo|y\/o|year\s*-?\s*old)\b/i.test(normalized) ||
+    /^(?:\d{1,4}[\).:-]\s*)?a\s+\d{1,3}\s*-\s*year\s*-\s*old\b/i.test(normalized) ||
+    /\b(presents?|present|came|coming|history|diagnosed|scheduled|asking|evaluated|complains|what|which|best|most likely)\b/i.test(normalized)
   );
 }
 
@@ -1294,16 +1314,18 @@ function applyCleanup(
         question.answer.correctChoiceId &&
         choices.some((choice) => choice.id === question.answer.correctChoiceId);
 
+      const stem = preserveFullStem(question.versions.quizReady.stem, cleaned.stem);
+
       return {
         ...question,
         versions: {
           source: question.versions.source,
           normalized: {
-            stem: cleaned.stem,
+            stem,
             choices,
           },
           quizReady: {
-            stem: cleaned.stem,
+            stem,
             choices,
           },
         },
@@ -1320,6 +1342,25 @@ function applyCleanup(
       };
     })
     .filter((question) => question.usabilityStatus !== "not_a_question");
+}
+
+function preserveFullStem(sourceStem: string, cleanedStem: string) {
+  const source = sourceStem.replace(/\s+/g, " ").trim();
+  const cleaned = cleanedStem.replace(/\s+/g, " ").trim();
+
+  if (!cleaned) {
+    return source;
+  }
+
+  if (cleaned.length < source.length * 0.9) {
+    return source;
+  }
+
+  if (source.includes("?") && !cleaned.includes("?")) {
+    return source;
+  }
+
+  return cleaned;
 }
 
 export default function Home() {

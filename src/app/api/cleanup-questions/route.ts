@@ -24,7 +24,7 @@ const cleanupQuestionSchema = z.object({
 });
 
 const requestSchema = z.object({
-  questions: z.array(cleanupQuestionSchema).max(40),
+  questions: z.array(cleanupQuestionSchema).max(500),
 });
 
 const cleanupResponseSchema = z.object({
@@ -76,7 +76,7 @@ Rules:
 - Remove choices that are not actual answer options.
 - Do not answer the questions.
 - Do not add medical facts.
-- Preserve the source wording as much as possible.
+- Preserve the source stem wording. Do not summarize, shorten, paraphrase, or remove clinical details from stems.
 - If uncertain, keep the item but mark review_required and add a short warning.
 - Return JSON only.
 
