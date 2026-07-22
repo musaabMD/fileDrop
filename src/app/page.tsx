@@ -1334,6 +1334,7 @@ export default function Home() {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [quizAnswers, setQuizAnswers] = useState<QuizAnswer>({});
+  const [simpleQuizIndex, setSimpleQuizIndex] = useState(0);
   const [submitted, setSubmitted] = useState(false);
   const [useVision, setUseVision] = useState(false);
   const [useOcr, setUseOcr] = useState(true);
@@ -1391,6 +1392,7 @@ export default function Home() {
     setApiJob(null);
     setAiUsage([]);
     setQuizAnswers({});
+    setSimpleQuizIndex(0);
     setSubmitted(false);
     setError("");
 
@@ -1635,6 +1637,9 @@ export default function Home() {
     setProgress({ current: 0, total: 0, label: "" });
     setError("");
     setFileName("");
+    setQuizAnswers({});
+    setSimpleQuizIndex(0);
+    setSubmitted(false);
   }
 
   const isWorking = phase === "rendering" || phase === "extracting";
@@ -1643,6 +1648,20 @@ export default function Home() {
     const progressPercent = progress.total
       ? Math.round((progress.current / progress.total) * 100)
       : 0;
+    const currentQuestion =
+      approvedQuestions[Math.min(simpleQuizIndex, Math.max(0, approvedQuestions.length - 1))];
+    const currentQuestionAssets = currentQuestion
+      ? assets.filter(
+          (asset) =>
+            currentQuestion.assets.includes(asset.id) || asset.questionId === currentQuestion.id,
+        )
+      : [];
+    const selectedChoiceId = currentQuestion ? quizAnswers[currentQuestion.id] : null;
+    const answerKnown =
+      currentQuestion?.answer.status === "explicit" ||
+      currentQuestion?.answer.status === "editor_confirmed";
+    const selectedIsCorrect =
+      Boolean(selectedChoiceId) && selectedChoiceId === currentQuestion?.answer.correctChoiceId;
 
     return (
       <main className="min-h-screen bg-white text-[#0F172A]">
@@ -1727,30 +1746,129 @@ export default function Home() {
             ) : null}
 
             {phase === "done" ? (
-              <div className="mt-5 rounded-2xl bg-emerald-50 p-4 text-center">
-                <p className="text-lg font-black text-emerald-900">
-                  Ready: {questions.length} question{questions.length === 1 ? "" : "s"} and{" "}
-                  {assets.length} image{assets.length === 1 ? "" : "s"}
-                </p>
-                <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:justify-center">
-                  {apiJob ? (
-                    <a
-                      href={apiJob.resultUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="rounded-2xl bg-[#1CB0F6] px-5 py-3 text-sm font-black text-white shadow-[0_5px_0_#1899D6]"
-                    >
-                      Open result
-                    </a>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={exportJson}
-                    className="rounded-2xl bg-[#58CC02] px-5 py-3 text-sm font-black text-white shadow-[0_5px_0_#46A302]"
-                  >
-                    Download JSON
-                  </button>
+              <div className="mt-5 rounded-[22px] bg-emerald-50 p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-black uppercase tracking-wide text-emerald-700">
+                      Quiz ready
+                    </p>
+                    <p className="mt-1 text-2xl font-black text-emerald-950">
+                      {approvedQuestions.length} question{approvedQuestions.length === 1 ? "" : "s"}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-white px-4 py-3 text-sm font-black text-emerald-900">
+                    {assets.length} image{assets.length === 1 ? "" : "s"}
+                  </div>
                 </div>
+
+                {currentQuestion ? (
+                  <section className="mt-5 rounded-[20px] border-2 border-emerald-100 bg-white p-4">
+                    <div className="mb-4 flex items-center justify-between gap-3">
+                      <span className="rounded-full bg-[#EAF6FF] px-3 py-1 text-sm font-black text-[#1899D6]">
+                        Question {simpleQuizIndex + 1} of {approvedQuestions.length}
+                      </span>
+                      {selectedChoiceId && answerKnown ? (
+                        <span
+                          className={`rounded-full px-3 py-1 text-sm font-black ${
+                            selectedIsCorrect
+                              ? "bg-emerald-100 text-emerald-800"
+                              : "bg-rose-100 text-rose-800"
+                          }`}
+                        >
+                          {selectedIsCorrect ? "Correct" : "Review"}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <p className="text-lg font-black leading-8 text-zinc-950">
+                      {currentQuestion.versions.quizReady.stem}
+                    </p>
+
+                    {currentQuestionAssets.length ? (
+                      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                        {currentQuestionAssets.map((asset) =>
+                          asset.previewUrl ? (
+                            <img
+                              key={asset.id}
+                              src={asset.previewUrl}
+                              alt={`Question image page ${asset.documentPageNumber}`}
+                              className="max-h-72 w-full rounded-2xl border-2 border-zinc-100 object-contain"
+                            />
+                          ) : null,
+                        )}
+                      </div>
+                    ) : null}
+
+                    <div className="mt-5 grid gap-3">
+                      {currentQuestion.versions.quizReady.choices.map((choice) => {
+                        const isSelected = selectedChoiceId === choice.id;
+                        const isCorrect = answerKnown && currentQuestion.answer.correctChoiceId === choice.id;
+                        const showCorrect = Boolean(selectedChoiceId) && isCorrect;
+                        const showWrong = Boolean(selectedChoiceId) && isSelected && !isCorrect;
+
+                        return (
+                          <button
+                            key={choice.id}
+                            type="button"
+                            onClick={() =>
+                              setQuizAnswers((current) => ({
+                                ...current,
+                                [currentQuestion.id]: choice.id,
+                              }))
+                            }
+                            className={`flex items-start gap-3 rounded-2xl border-2 px-4 py-4 text-left text-base font-extrabold transition ${
+                              showCorrect
+                                ? "border-emerald-300 bg-emerald-50 text-emerald-900"
+                                : showWrong
+                                  ? "border-rose-300 bg-rose-50 text-rose-900"
+                                  : isSelected
+                                    ? "border-[#1CB0F6] bg-[#EAF6FF] text-zinc-950"
+                                    : "border-zinc-200 bg-white text-zinc-800 hover:border-zinc-300 hover:bg-zinc-50"
+                            }`}
+                          >
+                            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-zinc-100 text-sm">
+                              {choice.label ?? choice.orderIndex + 1}
+                            </span>
+                            <span>{choice.text}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {selectedChoiceId && answerKnown && !selectedIsCorrect ? (
+                      <p className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-sm font-bold text-amber-900">
+                        Answer: {currentQuestion.answer.sourceChoiceLabel}
+                      </p>
+                    ) : null}
+
+                    <div className="mt-5 flex gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setSimpleQuizIndex((index) => Math.max(0, index - 1))}
+                        disabled={simpleQuizIndex === 0}
+                        className="flex-1 rounded-2xl border-2 border-zinc-200 bg-white px-4 py-3 text-sm font-black text-zinc-700 disabled:opacity-40"
+                      >
+                        Back
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSimpleQuizIndex((index) =>
+                            Math.min(approvedQuestions.length - 1, index + 1),
+                          )
+                        }
+                        disabled={simpleQuizIndex >= approvedQuestions.length - 1}
+                        className="flex-1 rounded-2xl bg-[#1CB0F6] px-4 py-3 text-sm font-black text-white shadow-[0_5px_0_#1899D6] disabled:bg-zinc-200 disabled:text-zinc-400 disabled:shadow-none"
+                      >
+                        Next
+                      </button>
+                    </div>
+                  </section>
+                ) : (
+                  <p className="mt-4 rounded-2xl bg-white px-4 py-4 text-center text-sm font-bold text-zinc-600">
+                    No quiz questions were found. Try another file.
+                  </p>
+                )}
               </div>
             ) : null}
 
