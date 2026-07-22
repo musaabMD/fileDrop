@@ -630,6 +630,42 @@ function buildExportPayload({
   };
 }
 
+function questionNeedsVisual(question: CanonicalQuestion) {
+  return /\b(image|figure|attached|shown|x-?ray|radiograph|ct|mri|ultrasound|scan|ecg|ekg|histology|pathology|fundoscopy|cxr|chest\s*x-?ray)\b/i.test(
+    question.versions.quizReady.stem,
+  );
+}
+
+function shouldShowAssetWithQuestion(question: CanonicalQuestion, asset: LocalAsset) {
+  if (
+    [
+      "required_to_answer",
+      "medical_image",
+      "laboratory_result",
+      "table",
+      "chart",
+    ].includes(asset.role)
+  ) {
+    return true;
+  }
+
+  return questionNeedsVisual(question) && asset.role !== "contains_question_text";
+}
+
+function answerDisplayText(question: CanonicalQuestion) {
+  if (!question.answer.sourceChoiceLabel) {
+    return null;
+  }
+
+  const choice = question.versions.quizReady.choices.find(
+    (item) => item.id === question.answer.correctChoiceId || item.label === question.answer.sourceChoiceLabel,
+  );
+
+  return choice
+    ? `${question.answer.sourceChoiceLabel}. ${choice.text}`
+    : question.answer.sourceChoiceLabel;
+}
+
 async function createApiJob(file: File): Promise<ApiJob> {
   const response = await fetch("/api/jobs", {
     method: "POST",
@@ -911,6 +947,9 @@ function buildRecallStyleQuestion(
   const questionEnd = contentLines.findIndex((line) => line.includes("?"));
   let stemLines: string[];
   let choiceLines: string[];
+  let answerLabel = answerFromBlock.label;
+  let answerRawText = answerFromBlock.rawText;
+  let answerUncertain = answerFromBlock.uncertain;
 
   if (questionEnd >= 0 && contentLines.length - questionEnd - 1 >= 2) {
     stemLines = contentLines.slice(0, questionEnd + 1);
@@ -925,11 +964,19 @@ function buildRecallStyleQuestion(
     choiceLines = trailingChoices;
   }
 
-  choiceLines = trimDanglingTailChoices(choiceLines
+  const inferredAnswer = inferAnswerFromRepeatedChoiceLines(choiceLines);
+  if (!answerLabel && inferredAnswer) {
+    answerLabel = inferredAnswer.label;
+    answerRawText = inferredAnswer.rawText;
+    answerUncertain = false;
+    choiceLines = inferredAnswer.choiceLines;
+  }
+
+  choiceLines = dedupeChoiceTexts(trimDanglingTailChoices(choiceLines
     .map((line) => line.replace(/^[-*•]\s*/, "").trim())
     .map((line, index) => cleanChoiceText(line, String.fromCharCode(65 + index)))
     .filter((line) => line && !isHeaderOrComment(line) && !isAnswerLine(line) && !isCategoryChoice(line))
-    .slice(0, 6));
+    .slice(0, 6)));
 
   if (choiceLines.length < 2 || !stemLines.join(" ").trim()) {
     return null;
@@ -953,11 +1000,63 @@ function buildRecallStyleQuestion(
     questionIndex,
     stem,
     choices,
-    answerLabel: answerFromBlock.label,
-    answerRawText: answerFromBlock.rawText,
-    answerUncertain: answerFromBlock.uncertain,
-    confidence: answerFromBlock.label ? 0.76 : 0.68,
+    answerLabel,
+    answerRawText,
+    answerUncertain,
+    confidence: answerLabel ? 0.78 : 0.68,
   });
+}
+
+function inferAnswerFromRepeatedChoiceLines(lines: string[]) {
+  for (let candidateIndex = lines.length - 1; candidateIndex >= 0; candidateIndex -= 1) {
+    const rawText = lines[candidateIndex]?.trim() ?? "";
+    if (!rawText || isHeaderOrComment(rawText)) {
+      continue;
+    }
+
+    const labeled = parseLabeledChoiceLine(rawText);
+    if (!labeled) {
+      continue;
+    }
+
+    const expectedChoiceIndex = labeled.label.charCodeAt(0) - 65;
+    const expectedRaw = lines[expectedChoiceIndex];
+    const expectedText = expectedRaw
+      ? cleanChoiceText(expectedRaw, labeled.label)
+      : "";
+    const duplicatedText = normalizeChoiceForDedupe(expectedText) === normalizeChoiceForDedupe(labeled.text);
+    const duplicatedEarlier = lines
+      .slice(0, candidateIndex)
+      .some(
+        (line, index) =>
+          normalizeChoiceForDedupe(cleanChoiceText(line, String.fromCharCode(65 + index))) ===
+          normalizeChoiceForDedupe(labeled.text),
+      );
+
+    if (!duplicatedText && !duplicatedEarlier) {
+      continue;
+    }
+
+    return {
+      label: labeled.label,
+      rawText,
+      choiceLines: lines.filter((_, index) => index !== candidateIndex),
+    };
+  }
+
+  return null;
+}
+
+function parseLabeledChoiceLine(line: string) {
+  const match = cleanOcrText(line).match(/^([A-H])[\).:-]\s*(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    label: match[1].toUpperCase(),
+    text: cleanChoiceText(match[2], match[1].toUpperCase()),
+  };
 }
 
 function trimDanglingTailChoices(lines: string[]) {
@@ -973,6 +1072,32 @@ function trimDanglingTailChoices(lines: string[]) {
     !/\b(type|stage|grade|class|group)\b/i.test(last);
 
   return looksLikePageBreakFragment ? previousChoices : lines;
+}
+
+function dedupeChoiceTexts(lines: string[]) {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+
+  for (const line of lines) {
+    const normalized = normalizeChoiceForDedupe(line);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+    deduped.push(line);
+  }
+
+  return deduped;
+}
+
+function normalizeChoiceForDedupe(line: string) {
+  return cleanOcrText(line)
+    .toLowerCase()
+    .replace(/^[a-h][\).:-]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}.%/ -]/gu, "")
+    .trim();
 }
 
 function collectTrailingChoices(lines: string[]) {
@@ -1138,6 +1263,8 @@ function isHeaderOrComment(line: string) {
     /^The missing questions/i.test(line) ||
     /^Wish you all/i.test(line) ||
     /^Alhomrani:/i.test(line) ||
+    /https?:\/\/|t\.me\/|Alhomrani/i.test(line) ||
+    /^\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|July|Aug|Sep|Oct|Nov|Dec)\b/i.test(line) ||
     /Questions written by many/i.test(line) ||
     /Collected\s*&\s*Edited by/i.test(line) ||
     /\bTelegram\b|\bMOF Group\b/i.test(line) ||
@@ -1297,8 +1424,21 @@ function applyCleanup(
       }
 
       const choiceById = new Map(question.versions.quizReady.choices.map((choice) => [choice.id, choice]));
+      const seenChoiceTexts = new Set<string>();
       const choices = cleaned.choices
         .filter((choice) => choice.keep)
+        .filter((choice) => {
+          const text = cleanChoiceText(choice.text, choice.label);
+          const normalized = normalizeChoiceForDedupe(text);
+          if (!normalized || isHeaderOrComment(text) || isAnswerLine(text) || isCategoryChoice(text)) {
+            return false;
+          }
+          if (seenChoiceTexts.has(normalized)) {
+            return false;
+          }
+          seenChoiceTexts.add(normalized);
+          return true;
+        })
         .map((choice, index) => ({
           ...(choiceById.get(choice.id) ?? {
             id: choice.id,
@@ -1307,7 +1447,7 @@ function applyCleanup(
             boundingBox: null,
           }),
           label: choice.label,
-          text: choice.text,
+          text: cleanChoiceText(choice.text, choice.label),
           orderIndex: index,
         }));
       const correctChoiceStillExists =
@@ -1691,11 +1831,17 @@ export default function Home() {
       : 0;
     const currentQuestion =
       approvedQuestions[Math.min(simpleQuizIndex, Math.max(0, approvedQuestions.length - 1))];
-    const currentQuestionAssets = currentQuestion
+    const allCurrentQuestionAssets = currentQuestion
       ? assets.filter(
           (asset) =>
             currentQuestion.assets.includes(asset.id) || asset.questionId === currentQuestion.id,
         )
+      : [];
+    const currentQuestionAssets = currentQuestion
+      ? allCurrentQuestionAssets.filter((asset) => shouldShowAssetWithQuestion(currentQuestion, asset))
+      : [];
+    const explanationAssets = currentQuestion
+      ? allCurrentQuestionAssets.filter((asset) => !shouldShowAssetWithQuestion(currentQuestion, asset))
       : [];
     const selectedChoiceId = currentQuestion ? quizAnswers[currentQuestion.id] : null;
     const answerKnown =
@@ -1703,66 +1849,80 @@ export default function Home() {
       currentQuestion?.answer.status === "editor_confirmed";
     const selectedIsCorrect =
       Boolean(selectedChoiceId) && selectedChoiceId === currentQuestion?.answer.correctChoiceId;
+    const answerText = currentQuestion ? answerDisplayText(currentQuestion) : null;
 
     return (
       <main className="min-h-screen bg-white text-[#0F172A]">
-        <div className="mx-auto flex min-h-screen w-full max-w-3xl items-center justify-center px-4 py-8">
+        <div
+          className={`mx-auto flex min-h-screen w-full px-4 py-8 ${
+            phase === "done"
+              ? "max-w-6xl items-start justify-center"
+              : "max-w-3xl items-center justify-center"
+          }`}
+        >
           <section className="w-full rounded-[24px] bg-white p-6 sm:p-8">
-            <div className="mb-7 flex items-center justify-between">
-              <h1 className="text-[34px] font-black leading-none tracking-normal sm:text-[38px]">
-                Add a file
-              </h1>
-              <button
-                type="button"
-                onClick={resetRun}
-                className="grid h-10 w-10 place-items-center rounded-full text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900"
-                aria-label="Clear"
-              >
-                <X className="h-7 w-7" strokeWidth={2.4} />
-              </button>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => inputRef.current?.click()}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => {
-                event.preventDefault();
-                const file = event.dataTransfer.files[0];
-                if (file) void processFile(file);
-              }}
-              disabled={isWorking}
-              className="flex min-h-[245px] w-full flex-col items-center justify-center gap-5 rounded-[22px] border-2 border-dashed border-zinc-200 bg-white px-6 py-10 text-center text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-wait disabled:opacity-80"
-            >
-              <input
-                ref={inputRef}
-                hidden
-                type="file"
-                accept="application/pdf,.pdf"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) void processFile(file);
-                }}
-              />
-              {isWorking ? (
-                <Loader2 className="h-12 w-12 animate-spin" strokeWidth={2.3} />
-              ) : (
-                <FileUp className="h-12 w-12" strokeWidth={2.3} />
-              )}
-              <span className="text-[22px] font-extrabold">
-                {fileName || "Drop any file here or tap to browse"}
-              </span>
-            </button>
+            {phase !== "done" ? (
+              <div className="mb-7 flex items-center justify-between">
+                <h1 className="text-[34px] font-black leading-none tracking-normal sm:text-[38px]">
+                  Add a file
+                </h1>
+                <button
+                  type="button"
+                  onClick={resetRun}
+                  className="grid h-10 w-10 place-items-center rounded-full text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900"
+                  aria-label="Clear"
+                >
+                  <X className="h-7 w-7" strokeWidth={2.4} />
+                </button>
+              </div>
+            ) : null}
 
             <input
-              className="mt-6 w-full rounded-[20px] border-2 border-zinc-200 px-5 py-5 text-[22px] font-extrabold text-zinc-700 outline-none placeholder:text-zinc-400 focus:border-sky-400"
-              value={fileName.replace(/\.[^.]+$/, "")}
-              onChange={(event) => setFileName(event.target.value)}
-              placeholder="File name (e.g. March Combined)"
-              aria-label="File name"
+              ref={inputRef}
+              hidden
+              type="file"
+              accept="application/pdf,.pdf"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void processFile(file);
+              }}
             />
 
-            {progress.total || isWorking ? (
+            {phase !== "done" ? (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  const file = event.dataTransfer.files[0];
+                  if (file) void processFile(file);
+                }}
+                disabled={isWorking}
+                className="flex min-h-[245px] w-full flex-col items-center justify-center gap-5 rounded-[22px] border-2 border-dashed border-zinc-200 bg-white px-6 py-10 text-center text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-wait disabled:opacity-80"
+              >
+                {isWorking ? (
+                  <Loader2 className="h-12 w-12 animate-spin" strokeWidth={2.3} />
+                ) : (
+                  <FileUp className="h-12 w-12" strokeWidth={2.3} />
+                )}
+                <span className="text-[22px] font-extrabold">
+                  {fileName || "Drop any file here or tap to browse"}
+                </span>
+              </button>
+            ) : null}
+
+            {phase !== "done" ? (
+              <input
+                className="mt-6 w-full rounded-[20px] border-2 border-zinc-200 px-5 py-5 text-[22px] font-extrabold text-zinc-700 outline-none placeholder:text-zinc-400 focus:border-sky-400"
+                value={fileName.replace(/\.[^.]+$/, "")}
+                onChange={(event) => setFileName(event.target.value)}
+                placeholder="File name (e.g. March Combined)"
+                aria-label="File name"
+              />
+            ) : null}
+
+            {phase !== "done" && (progress.total || isWorking) ? (
               <div className="mt-5">
                 <div className="h-3 overflow-hidden rounded-full bg-zinc-100">
                   <div
@@ -1771,11 +1931,7 @@ export default function Home() {
                   />
                 </div>
                 <p className="mt-3 text-center text-sm font-extrabold text-zinc-500">
-                  {phase === "done"
-                    ? "File ready"
-                    : progress.total
-                      ? `Processing page ${progress.current} of ${progress.total}`
-                      : "Preparing file"}
+                  {progress.total ? `Processing page ${progress.current} of ${progress.total}` : "Preparing file"}
                 </p>
               </div>
             ) : null}
@@ -1787,7 +1943,7 @@ export default function Home() {
             ) : null}
 
             {phase === "done" ? (
-              <div className="mt-5 rounded-[22px] bg-emerald-50 p-5">
+              <div className="rounded-[22px] bg-emerald-50 p-5 sm:p-7">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-black uppercase tracking-wide text-emerald-700">
@@ -1800,10 +1956,18 @@ export default function Home() {
                   <div className="rounded-2xl bg-white px-4 py-3 text-sm font-black text-emerald-900">
                     {assets.length} image{assets.length === 1 ? "" : "s"}
                   </div>
+                  <button
+                    type="button"
+                    onClick={resetRun}
+                    className="grid h-11 w-11 place-items-center rounded-full bg-white text-zinc-500 transition hover:text-zinc-950"
+                    aria-label="Close result"
+                  >
+                    <X className="h-6 w-6" strokeWidth={2.4} />
+                  </button>
                 </div>
 
                 {currentQuestion ? (
-                  <section className="mt-5 rounded-[20px] border-2 border-emerald-100 bg-white p-4">
+                  <section className="mt-5 rounded-[20px] border-2 border-emerald-100 bg-white p-5 sm:p-7">
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <span className="rounded-full bg-[#EAF6FF] px-3 py-1 text-sm font-black text-[#1899D6]">
                         Question {simpleQuizIndex + 1} of {approvedQuestions.length}
@@ -1877,9 +2041,37 @@ export default function Home() {
                     </div>
 
                     {selectedChoiceId && answerKnown && !selectedIsCorrect ? (
-                      <p className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-sm font-bold text-amber-900">
-                        Answer: {currentQuestion.answer.sourceChoiceLabel}
-                      </p>
+                      null
+                    ) : null}
+
+                    {selectedChoiceId ? (
+                      <div className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-950">
+                        {answerKnown && answerText ? (
+                          <p>Correct answer: {answerText}</p>
+                        ) : (
+                          <p>Answer key was not clear in the source.</p>
+                        )}
+                        {answerKnown ? (
+                          <p className="mt-1 text-emerald-800">Explanation: answer key found in the source file.</p>
+                        ) : null}
+                        {explanationAssets.length ? (
+                          <details className="mt-3">
+                            <summary className="cursor-pointer text-emerald-800">Source image</summary>
+                            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                              {explanationAssets.map((asset) =>
+                                asset.previewUrl ? (
+                                  <img
+                                    key={asset.id}
+                                    src={asset.previewUrl}
+                                    alt={`Source image page ${asset.documentPageNumber}`}
+                                    className="max-h-72 w-full rounded-2xl border-2 border-emerald-100 bg-white object-contain"
+                                  />
+                                ) : null,
+                              )}
+                            </div>
+                          </details>
+                        ) : null}
+                      </div>
                     ) : null}
 
                     <div className="mt-5 flex gap-3">
@@ -1913,24 +2105,26 @@ export default function Home() {
               </div>
             ) : null}
 
-            <button
-              type="button"
-              onClick={() => inputRef.current?.click()}
-              disabled={isWorking}
-              className="mt-6 flex w-full items-center justify-center gap-2 rounded-[22px] bg-[#58CC02] px-5 py-5 text-[20px] font-black text-white shadow-[0_6px_0_#46A302] transition active:translate-y-1 active:shadow-none disabled:bg-zinc-200 disabled:text-zinc-400 disabled:shadow-[0_6px_0_#cfcfcf]"
-            >
-              {isWorking ? (
-                <>
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                  Processing
-                </>
-              ) : (
-                <>
-                  <FileUp className="h-5 w-5" />
-                  {fileName ? "Choose another file" : "Choose file"}
-                </>
-              )}
-            </button>
+            {phase !== "done" ? (
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                disabled={isWorking}
+                className="mt-6 flex w-full items-center justify-center gap-2 rounded-[22px] bg-[#58CC02] px-5 py-5 text-[20px] font-black text-white shadow-[0_6px_0_#46A302] transition active:translate-y-1 active:shadow-none disabled:bg-zinc-200 disabled:text-zinc-400 disabled:shadow-[0_6px_0_#cfcfcf]"
+              >
+                {isWorking ? (
+                  <>
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                    Processing
+                  </>
+                ) : (
+                  <>
+                    <FileUp className="h-5 w-5" />
+                    Choose file
+                  </>
+                )}
+              </button>
+            ) : null}
           </section>
         </div>
       </main>
