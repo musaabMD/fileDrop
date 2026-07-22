@@ -13,7 +13,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   BoundingBox,
   CanonicalQuestion,
@@ -1324,6 +1324,7 @@ function applyCleanup(
 
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [simpleMode, setSimpleMode] = useState(true);
   const [phase, setPhase] = useState<Phase>("idle");
   const [tab, setTab] = useState<Tab>("review");
   const [fileName, setFileName] = useState("");
@@ -1335,11 +1336,22 @@ export default function Home() {
   const [quizAnswers, setQuizAnswers] = useState<QuizAnswer>({});
   const [submitted, setSubmitted] = useState(false);
   const [useVision, setUseVision] = useState(false);
-  const [useOcr, setUseOcr] = useState(false);
+  const [useOcr, setUseOcr] = useState(true);
   const [useAiCleanup, setUseAiCleanup] = useState(true);
   const [markdownPages, setMarkdownPages] = useState<MarkdownPage[]>([]);
   const [apiJob, setApiJob] = useState<ApiJob | null>(null);
   const [aiUsage, setAiUsage] = useState<AiUsageRecord[]>([]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const isSimple = params.get("advanced") !== "1";
+    setSimpleMode(isSimple);
+    if (isSimple) {
+      setUseOcr(true);
+      setUseAiCleanup(true);
+      setUseVision(false);
+    }
+  }, []);
 
   const approvedQuestions = useMemo(
     () =>
@@ -1610,6 +1622,160 @@ export default function Home() {
     anchor.download = `${fileName || "filedrop"}-extraction.json`;
     anchor.click();
     URL.revokeObjectURL(url);
+  }
+
+  function resetRun() {
+    setPhase("idle");
+    setQuestions([]);
+    setAssets([]);
+    setWarnings([]);
+    setMarkdownPages([]);
+    setApiJob(null);
+    setAiUsage([]);
+    setProgress({ current: 0, total: 0, label: "" });
+    setError("");
+    setFileName("");
+  }
+
+  const isWorking = phase === "rendering" || phase === "extracting";
+
+  if (simpleMode) {
+    const progressPercent = progress.total
+      ? Math.round((progress.current / progress.total) * 100)
+      : 0;
+
+    return (
+      <main className="min-h-screen bg-white text-[#0F172A]">
+        <div className="mx-auto flex min-h-screen w-full max-w-3xl items-center justify-center px-4 py-8">
+          <section className="w-full rounded-[24px] bg-white p-6 sm:p-8">
+            <div className="mb-7 flex items-center justify-between">
+              <h1 className="text-[34px] font-black leading-none tracking-normal sm:text-[38px]">
+                Add a file
+              </h1>
+              <button
+                type="button"
+                onClick={resetRun}
+                className="grid h-10 w-10 place-items-center rounded-full text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900"
+                aria-label="Clear"
+              >
+                <X className="h-7 w-7" strokeWidth={2.4} />
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                const file = event.dataTransfer.files[0];
+                if (file) void processFile(file);
+              }}
+              disabled={isWorking}
+              className="flex min-h-[245px] w-full flex-col items-center justify-center gap-5 rounded-[22px] border-2 border-dashed border-zinc-200 bg-white px-6 py-10 text-center text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-wait disabled:opacity-80"
+            >
+              <input
+                ref={inputRef}
+                hidden
+                type="file"
+                accept="application/pdf,.pdf"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void processFile(file);
+                }}
+              />
+              {isWorking ? (
+                <Loader2 className="h-12 w-12 animate-spin" strokeWidth={2.3} />
+              ) : (
+                <FileUp className="h-12 w-12" strokeWidth={2.3} />
+              )}
+              <span className="text-[22px] font-extrabold">
+                {fileName || "Drop any file here or tap to browse"}
+              </span>
+            </button>
+
+            <input
+              className="mt-6 w-full rounded-[20px] border-2 border-zinc-200 px-5 py-5 text-[22px] font-extrabold text-zinc-700 outline-none placeholder:text-zinc-400 focus:border-sky-400"
+              value={fileName.replace(/\.[^.]+$/, "")}
+              onChange={(event) => setFileName(event.target.value)}
+              placeholder="File name (e.g. March Combined)"
+              aria-label="File name"
+            />
+
+            {progress.total || isWorking ? (
+              <div className="mt-5">
+                <div className="h-3 overflow-hidden rounded-full bg-zinc-100">
+                  <div
+                    className="h-full rounded-full bg-[#58CC02] transition-all"
+                    style={{ width: `${progressPercent}%` }}
+                  />
+                </div>
+                <p className="mt-3 text-center text-sm font-extrabold text-zinc-500">
+                  {phase === "done"
+                    ? "File ready"
+                    : progress.total
+                      ? `Processing page ${progress.current} of ${progress.total}`
+                      : "Preparing file"}
+                </p>
+              </div>
+            ) : null}
+
+            {error ? (
+              <p className="mt-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">
+                {error}
+              </p>
+            ) : null}
+
+            {phase === "done" ? (
+              <div className="mt-5 rounded-2xl bg-emerald-50 p-4 text-center">
+                <p className="text-lg font-black text-emerald-900">
+                  Ready: {questions.length} question{questions.length === 1 ? "" : "s"} and{" "}
+                  {assets.length} image{assets.length === 1 ? "" : "s"}
+                </p>
+                <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:justify-center">
+                  {apiJob ? (
+                    <a
+                      href={apiJob.resultUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="rounded-2xl bg-[#1CB0F6] px-5 py-3 text-sm font-black text-white shadow-[0_5px_0_#1899D6]"
+                    >
+                      Open result
+                    </a>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={exportJson}
+                    className="rounded-2xl bg-[#58CC02] px-5 py-3 text-sm font-black text-white shadow-[0_5px_0_#46A302]"
+                  >
+                    Download JSON
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
+            <button
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              disabled={isWorking}
+              className="mt-6 flex w-full items-center justify-center gap-2 rounded-[22px] bg-[#58CC02] px-5 py-5 text-[20px] font-black text-white shadow-[0_6px_0_#46A302] transition active:translate-y-1 active:shadow-none disabled:bg-zinc-200 disabled:text-zinc-400 disabled:shadow-[0_6px_0_#cfcfcf]"
+            >
+              {isWorking ? (
+                <>
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  Processing
+                </>
+              ) : (
+                <>
+                  <FileUp className="h-5 w-5" />
+                  {fileName ? "Choose another file" : "Choose file"}
+                </>
+              )}
+            </button>
+          </section>
+        </div>
+      </main>
+    );
   }
 
   return (
