@@ -817,7 +817,7 @@ function startsNewRecallBlock(line: string, current: string[]) {
   }
 
   const trailingChoices = collectTrailingChoices(current);
-  const hasQuestionContext = current.some(looksLikeQuestionLine) || current.some(looksLikeQuestionStartLine);
+  const hasQuestionContext = current.some(looksLikeQuestionLine);
   if (trailingChoices.length < 2) {
     return false;
   }
