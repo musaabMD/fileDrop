@@ -44,6 +44,12 @@ type MarkdownPage = {
   source: "native" | "ocr" | "empty";
   text: string;
 };
+type PageScreenshot = {
+  pageNumber: number;
+  imageDataUrl: string;
+  width: number;
+  height: number;
+};
 type ApiJob = {
   id: string;
   statusUrl: string;
@@ -1521,8 +1527,10 @@ export default function Home() {
   const [useOcr, setUseOcr] = useState(true);
   const [useAiCleanup, setUseAiCleanup] = useState(true);
   const [markdownPages, setMarkdownPages] = useState<MarkdownPage[]>([]);
+  const [pageScreenshots, setPageScreenshots] = useState<PageScreenshot[]>([]);
   const [apiJob, setApiJob] = useState<ApiJob | null>(null);
   const [aiUsage, setAiUsage] = useState<AiUsageRecord[]>([]);
+  const [fullscreenImage, setFullscreenImage] = useState<string | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1570,8 +1578,10 @@ export default function Home() {
     setAssets([]);
     setWarnings([]);
     setMarkdownPages([]);
+    setPageScreenshots([]);
     setApiJob(null);
     setAiUsage([]);
+    setFullscreenImage(null);
     setQuizAnswers({});
     setSimpleQuizIndex(0);
     setSubmitted(false);
@@ -1608,6 +1618,15 @@ export default function Home() {
           total,
           label: "extracting page",
         });
+        setPageScreenshots((current) => [
+          ...current.filter((item) => item.pageNumber !== page.pageNumber),
+          {
+            pageNumber: page.pageNumber,
+            imageDataUrl: page.imageDataUrl,
+            width: page.width,
+            height: page.height,
+          },
+        ]);
 
         try {
           let pageForExtraction = page;
@@ -1813,8 +1832,10 @@ export default function Home() {
     setAssets([]);
     setWarnings([]);
     setMarkdownPages([]);
+    setPageScreenshots([]);
     setApiJob(null);
     setAiUsage([]);
+    setFullscreenImage(null);
     setProgress({ current: 0, total: 0, label: "" });
     setError("");
     setFileName("");
@@ -1840,9 +1861,9 @@ export default function Home() {
     const currentQuestionAssets = currentQuestion
       ? allCurrentQuestionAssets.filter((asset) => shouldShowAssetWithQuestion(currentQuestion, asset))
       : [];
-    const explanationAssets = currentQuestion
-      ? allCurrentQuestionAssets.filter((asset) => !shouldShowAssetWithQuestion(currentQuestion, asset))
-      : [];
+    const sourcePageScreenshot = currentQuestion
+      ? pageScreenshots.find((page) => page.pageNumber === currentQuestion.source.pageNumbers[0])
+      : null;
     const selectedChoiceId = currentQuestion ? quizAnswers[currentQuestion.id] : null;
     const answerKnown =
       currentQuestion?.answer.status === "explicit" ||
@@ -1856,11 +1877,15 @@ export default function Home() {
         <div
           className={`mx-auto flex min-h-screen w-full px-4 py-8 ${
             phase === "done"
-              ? "max-w-6xl items-start justify-center"
+              ? "max-w-none items-start justify-stretch p-0 sm:p-4"
               : "max-w-3xl items-center justify-center"
           }`}
         >
-          <section className="w-full rounded-[24px] bg-white p-6 sm:p-8">
+          <section
+            className={`w-full bg-white ${
+              phase === "done" ? "rounded-none p-0 sm:rounded-[24px] sm:p-4" : "rounded-[24px] p-6 sm:p-8"
+            }`}
+          >
             {phase !== "done" ? (
               <div className="mb-7 flex items-center justify-between">
                 <h1 className="text-[34px] font-black leading-none tracking-normal sm:text-[38px]">
@@ -1943,7 +1968,7 @@ export default function Home() {
             ) : null}
 
             {phase === "done" ? (
-              <div className="rounded-[22px] bg-emerald-50 p-5 sm:p-7">
+              <div className="min-h-screen rounded-none bg-emerald-50 p-4 sm:min-h-0 sm:rounded-[22px] sm:p-6">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-black uppercase tracking-wide text-emerald-700">
@@ -1952,9 +1977,6 @@ export default function Home() {
                     <p className="mt-1 text-2xl font-black text-emerald-950">
                       {approvedQuestions.length} question{approvedQuestions.length === 1 ? "" : "s"}
                     </p>
-                  </div>
-                  <div className="rounded-2xl bg-white px-4 py-3 text-sm font-black text-emerald-900">
-                    {assets.length} image{assets.length === 1 ? "" : "s"}
                   </div>
                   <button
                     type="button"
@@ -1993,12 +2015,18 @@ export default function Home() {
                       <div className="mt-4 grid gap-3 sm:grid-cols-2">
                         {currentQuestionAssets.map((asset) =>
                           asset.previewUrl ? (
-                            <img
+                            <button
                               key={asset.id}
-                              src={asset.previewUrl}
-                              alt={`Question image page ${asset.documentPageNumber}`}
-                              className="max-h-72 w-full rounded-2xl border-2 border-zinc-100 object-contain"
-                            />
+                              type="button"
+                              onClick={() => setFullscreenImage(asset.previewUrl ?? null)}
+                              className="rounded-2xl border-2 border-zinc-100 bg-white p-2"
+                            >
+                              <img
+                                src={asset.previewUrl}
+                                alt={`Question image page ${asset.documentPageNumber}`}
+                                className="max-h-[55vh] w-full object-contain"
+                              />
+                            </button>
                           ) : null,
                         )}
                       </div>
@@ -2054,21 +2082,20 @@ export default function Home() {
                         {answerKnown ? (
                           <p className="mt-1 text-emerald-800">Explanation: answer key found in the source file.</p>
                         ) : null}
-                        {explanationAssets.length ? (
+                        {sourcePageScreenshot ? (
                           <details className="mt-3">
-                            <summary className="cursor-pointer text-emerald-800">Source image</summary>
-                            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                              {explanationAssets.map((asset) =>
-                                asset.previewUrl ? (
-                                  <img
-                                    key={asset.id}
-                                    src={asset.previewUrl}
-                                    alt={`Source image page ${asset.documentPageNumber}`}
-                                    className="max-h-72 w-full rounded-2xl border-2 border-emerald-100 bg-white object-contain"
-                                  />
-                                ) : null,
-                              )}
-                            </div>
+                            <summary className="cursor-pointer text-emerald-800">Source page</summary>
+                            <button
+                              type="button"
+                              onClick={() => setFullscreenImage(sourcePageScreenshot.imageDataUrl)}
+                              className="mt-3 w-full rounded-2xl border-2 border-emerald-100 bg-white p-2"
+                            >
+                              <img
+                                src={sourcePageScreenshot.imageDataUrl}
+                                alt={`Source page ${sourcePageScreenshot.pageNumber}`}
+                                className="max-h-[70vh] w-full object-contain"
+                              />
+                            </button>
                           </details>
                         ) : null}
                       </div>
@@ -2127,6 +2154,27 @@ export default function Home() {
             ) : null}
           </section>
         </div>
+        {fullscreenImage ? (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-3"
+            role="dialog"
+            aria-modal="true"
+          >
+            <button
+              type="button"
+              onClick={() => setFullscreenImage(null)}
+              className="absolute right-4 top-4 grid h-11 w-11 place-items-center rounded-full bg-white text-zinc-800"
+              aria-label="Close image"
+            >
+              <X className="h-6 w-6" strokeWidth={2.4} />
+            </button>
+            <img
+              src={fullscreenImage}
+              alt="Full screen source"
+              className="max-h-full max-w-full object-contain"
+            />
+          </div>
+        ) : null}
       </main>
     );
   }
