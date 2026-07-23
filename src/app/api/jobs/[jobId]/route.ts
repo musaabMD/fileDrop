@@ -49,6 +49,21 @@ export async function GET(_request: Request, context: RouteContext) {
     }
 
     const assets = await listJobAssets(DB, jobId);
+    const feedback = await DB.prepare<{ feedback_json: string | null }>(
+      `SELECT json_object(
+        'jobId', job_id,
+        'rating', rating,
+        'issue', issue,
+        'notes', notes,
+        'qualityScore', quality_score,
+        'createdAt', created_at,
+        'updatedAt', updated_at
+      ) AS feedback_json
+      FROM job_feedback
+      WHERE job_id = ?`,
+    )
+      .bind(jobId)
+      .first<{ feedback_json: string | null }>();
 
     const payload = {
       job: {
@@ -67,6 +82,7 @@ export async function GET(_request: Request, context: RouteContext) {
         markdownUrl: job.result_markdown_key ? `${publicResultUrl(job.id)}?format=markdown` : null,
         usage: parseJson(job.usage_json),
         stats: parseJson(job.stats_json),
+        feedback: parseJson(feedback?.feedback_json ?? null),
       },
       assets: assets.map((asset) => ({
         id: asset.id,

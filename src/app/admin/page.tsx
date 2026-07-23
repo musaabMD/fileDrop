@@ -45,6 +45,38 @@ type UsageSummary = {
     openRouterCost: number;
     avgDurationMs: number | null;
   }>;
+  feedback: {
+    totals: {
+      total: number;
+      likes: number;
+      dislikes: number;
+      averageQuality: number | null;
+    };
+    recent: Array<{
+      jobId: string;
+      sourceFilename: string | null;
+      rating: "like" | "dislike";
+      issue: string | null;
+      notes: string | null;
+      qualityScore: number | null;
+      createdAt: string;
+      updatedAt: string;
+    }>;
+  };
+  lastSession: {
+    id: string;
+    apiKeyId: string | null;
+    jobId: string | null;
+    sourceFilename: string | null;
+    route: string;
+    method: string;
+    statusCode: number;
+    durationMs: number;
+    requestBytes: number | null;
+    responseBytes: number | null;
+    openRouterCost: number;
+    createdAt: string;
+  } | null;
 };
 
 export default function AdminPage() {
@@ -171,12 +203,40 @@ export default function AdminPage() {
           {error ? <p className="mt-3 rounded-md bg-rose-50 p-3 text-sm text-rose-700">{error}</p> : null}
         </section>
 
-        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
           <Metric label="Active keys" value={activeKeys} />
           <Metric label="Calls" value={usage?.totals.calls ?? 0} />
           <Metric label="Jobs" value={usage?.totals.jobs ?? 0} />
           <Metric label="Failures" value={usage?.totals.failures ?? 0} />
           <Metric label="OpenRouter" value={`$${(usage?.totals.openRouterCost ?? 0).toFixed(6)}`} />
+          <Metric label="Likes" value={usage?.feedback.totals.likes ?? 0} />
+        </section>
+
+        <section className="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
+          <h2 className="text-sm font-semibold">Last session</h2>
+          {usage?.lastSession ? (
+            <>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Metric label="Source" value={usage.lastSession.sourceFilename ?? "n/a"} />
+                <Metric label="Route" value={`${usage.lastSession.method} ${usage.lastSession.route}`} />
+                <Metric label="Duration" value={`${usage.lastSession.durationMs} ms`} />
+                <Metric label="Cost" value={`$${usage.lastSession.openRouterCost.toFixed(6)}`} />
+              </div>
+              <div className="mt-4 rounded-md bg-zinc-50 p-3 text-sm text-zinc-700">
+                <p className="font-medium text-zinc-900">
+                  {usage.lastSession.sourceFilename ?? usage.lastSession.jobId ?? usage.lastSession.id}
+                </p>
+                <p className="mt-1">
+                  Status {usage.lastSession.statusCode} · {usage.lastSession.durationMs} ms ·
+                  {usage.lastSession.requestBytes == null ? " request n/a" : ` request ${usage.lastSession.requestBytes} bytes`} ·
+                  {usage.lastSession.responseBytes == null ? " response n/a" : ` response ${usage.lastSession.responseBytes} bytes`}
+                </p>
+                <p className="mt-1 text-xs text-zinc-500">{usage.lastSession.createdAt}</p>
+              </div>
+            </>
+          ) : (
+            <p className="mt-3 text-sm text-zinc-500">No usage events yet.</p>
+          )}
         </section>
 
         <section className="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
@@ -284,6 +344,34 @@ export default function AdminPage() {
                 </div>
               ))}
             </div>
+          </div>
+        </section>
+
+        <section className="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
+          <h2 className="text-sm font-semibold">Feedback</h2>
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            <Metric label="Total" value={usage?.feedback.totals.total ?? 0} />
+            <Metric label="Dislikes" value={usage?.feedback.totals.dislikes ?? 0} />
+            <Metric
+              label="Avg quality"
+              value={usage?.feedback.totals.averageQuality == null ? "n/a" : usage.feedback.totals.averageQuality.toFixed(1)}
+            />
+          </div>
+          <div className="mt-4 grid gap-2">
+            {(usage?.feedback.recent ?? []).map((entry) => (
+              <div key={`${entry.jobId}-${entry.updatedAt}`} className="rounded-md bg-zinc-50 p-3 text-sm">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="font-medium">{entry.sourceFilename ?? entry.jobId}</p>
+                    <p className="text-xs text-zinc-500">{entry.issue ?? "no issue"}{entry.qualityScore ? ` • score ${entry.qualityScore}/5` : ""}</p>
+                  </div>
+                  <span className={`rounded-md px-2 py-1 text-xs font-medium ${entry.rating === "like" ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
+                    {entry.rating}
+                  </span>
+                </div>
+                {entry.notes ? <p className="mt-2 text-zinc-700">{entry.notes}</p> : null}
+              </div>
+            ))}
           </div>
         </section>
       </div>

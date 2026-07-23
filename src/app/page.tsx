@@ -63,6 +63,8 @@ type AiUsageRecord = {
   usage?: unknown;
 };
 
+type FeedbackRating = "like" | "dislike";
+
 const MAX_RENDER_WIDTH = 1050;
 const IMAGE_QUALITY = 0.62;
 const MAX_VISION_PAGES = 3;
@@ -1531,6 +1533,11 @@ export default function Home() {
   const [apiJob, setApiJob] = useState<ApiJob | null>(null);
   const [aiUsage, setAiUsage] = useState<AiUsageRecord[]>([]);
   const [fullscreenImage, setFullscreenImage] = useState<string | null>(null);
+  const [feedbackRating, setFeedbackRating] = useState<FeedbackRating | null>(null);
+  const [feedbackIssue, setFeedbackIssue] = useState("");
+  const [feedbackNotes, setFeedbackNotes] = useState("");
+  const [feedbackSending, setFeedbackSending] = useState(false);
+  const [feedbackSent, setFeedbackSent] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1582,6 +1589,11 @@ export default function Home() {
     setApiJob(null);
     setAiUsage([]);
     setFullscreenImage(null);
+    setFeedbackRating(null);
+    setFeedbackIssue("");
+    setFeedbackNotes("");
+    setFeedbackSending(false);
+    setFeedbackSent(false);
     setQuizAnswers({});
     setSimpleQuizIndex(0);
     setSubmitted(false);
@@ -1778,6 +1790,39 @@ export default function Home() {
     }
   }
 
+  async function submitFeedback(rating: FeedbackRating) {
+    if (!apiJob?.id || feedbackSending) {
+      return;
+    }
+
+    setFeedbackRating(rating);
+    setFeedbackSending(true);
+
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(apiJob.id)}/feedback`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rating,
+          issue: rating === "dislike" ? (feedbackIssue.trim() || null) : null,
+          notes: feedbackNotes.trim() || null,
+          qualityScore: rating === "like" ? 5 : 1,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { message?: string; error?: string } | null;
+        throw new Error(payload?.message ?? payload?.error ?? "Could not save feedback.");
+      }
+
+      setFeedbackSent(true);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Could not save feedback.");
+    } finally {
+      setFeedbackSending(false);
+    }
+  }
+
   function setReviewStatus(
     questionId: string,
     reviewStatus: CanonicalQuestion["reviewStatus"],
@@ -1836,6 +1881,11 @@ export default function Home() {
     setApiJob(null);
     setAiUsage([]);
     setFullscreenImage(null);
+    setFeedbackRating(null);
+    setFeedbackIssue("");
+    setFeedbackNotes("");
+    setFeedbackSending(false);
+    setFeedbackSent(false);
     setProgress({ current: 0, total: 0, label: "" });
     setError("");
     setFileName("");
@@ -2097,6 +2147,83 @@ export default function Home() {
                               />
                             </button>
                           </details>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    {apiJob?.id ? (
+                      <div className="mt-4 rounded-2xl border border-zinc-200 bg-zinc-50 p-4">
+                        <p className="text-sm font-bold text-zinc-900">Was this result useful?</p>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setFeedbackRating("like")}
+                            disabled={feedbackSending}
+                            className={`rounded-full px-4 py-2 text-sm font-bold ${
+                              feedbackRating === "like"
+                                ? "bg-emerald-600 text-white"
+                                : "bg-white text-zinc-800 border border-zinc-300"
+                            }`}
+                          >
+                            Like
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setFeedbackRating("dislike")}
+                            disabled={feedbackSending}
+                            className={`rounded-full px-4 py-2 text-sm font-bold ${
+                              feedbackRating === "dislike"
+                                ? "bg-rose-600 text-white"
+                                : "bg-white text-zinc-800 border border-zinc-300"
+                            }`}
+                          >
+                            Dislike
+                          </button>
+                        </div>
+                        {feedbackRating === "dislike" ? (
+                          <div className="mt-4 grid gap-3">
+                            <select
+                              value={feedbackIssue}
+                              onChange={(event) => setFeedbackIssue(event.target.value)}
+                              className="rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm"
+                            >
+                              <option value="">What was wrong?</option>
+                              <option value="mixed_questions">Mixed questions together</option>
+                              <option value="wrong_choices">Wrong or duplicate choices</option>
+                              <option value="missing_answer">Missing answer key</option>
+                              <option value="bad_explanation">Bad explanation</option>
+                              <option value="too_slow">Too slow</option>
+                              <option value="other">Other</option>
+                            </select>
+                            <textarea
+                              value={feedbackNotes}
+                              onChange={(event) => setFeedbackNotes(event.target.value)}
+                              rows={3}
+                              maxLength={2000}
+                              placeholder="Short note"
+                              className="rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm"
+                            />
+                          </div>
+                        ) : (
+                          <textarea
+                            value={feedbackNotes}
+                            onChange={(event) => setFeedbackNotes(event.target.value)}
+                            rows={2}
+                            maxLength={2000}
+                            placeholder="Optional note"
+                            className="mt-4 w-full rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm"
+                          />
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void submitFeedback(feedbackRating ?? "like")}
+                          disabled={!feedbackRating || feedbackSending}
+                          className="mt-3 rounded-full bg-zinc-950 px-4 py-2 text-sm font-bold text-white disabled:bg-zinc-300"
+                        >
+                          {feedbackSending ? "Sending..." : "Send feedback"}
+                        </button>
+                        {feedbackSent ? (
+                          <p className="mt-3 text-sm font-bold text-emerald-700">Feedback saved.</p>
                         ) : null}
                       </div>
                     ) : null}
