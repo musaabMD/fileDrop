@@ -12,9 +12,11 @@ import { nowIso, publicResultUrl, publicStatusUrl } from "@/lib/server/jobs";
 const createJobSchema = z.object({
   filename: z.string().min(1).max(260),
   fileSize: z.number().int().nonnegative().optional(),
-  contentType: z.string().max(120).optional(),
   pageCount: z.number().int().positive().optional(),
+  contentType: z.string().max(120).optional(),
   callbackUrl: z.string().url().optional(),
+  sourceHash: z.string().min(32).max(128).optional(),
+  sourceFingerprint: z.string().min(32).max(300).optional(),
 });
 
 export async function POST(request: Request) {
@@ -36,8 +38,55 @@ export async function POST(request: Request) {
       return auth;
     }
 
-    const jobId = crypto.randomUUID();
     const timestamp = nowIso();
+    const fingerprint = parsed.data.sourceHash ?? null;
+    const sourceFingerprint = parsed.data.sourceFingerprint ?? null;
+
+    if (fingerprint && parsed.data.fileSize != null) {
+      const existing = await DB.prepare<{
+        id: string;
+        status: string;
+        result_json_key: string | null;
+        result_markdown_key: string | null;
+      }>(
+        `SELECT id, status, result_json_key, result_markdown_key
+         FROM processing_jobs
+         WHERE source_hash = ?
+           AND file_size = ?
+           AND source_filename = ?
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+      )
+        .bind(fingerprint, parsed.data.fileSize, parsed.data.filename)
+        .first();
+
+      if (existing) {
+        const payload = {
+          jobId: existing.id,
+          status: existing.status,
+          statusUrl: publicStatusUrl(existing.id),
+          resultUrl: existing.result_json_key ? publicResultUrl(existing.id) : null,
+          markdownUrl: existing.result_markdown_key ? `${publicResultUrl(existing.id)}?format=markdown` : null,
+          reused: true,
+        };
+
+        await recordUsageEvent(DB, {
+          apiKeyId: auth.apiKeyId,
+          jobId: existing.id,
+          route: "/api/jobs",
+          method: "POST",
+          statusCode: 200,
+          durationMs: Date.now() - startedAt,
+          requestBytes: requestByteLength(request),
+          responseBytes: estimateJsonBytes(payload),
+          meta: { authenticated: auth.authenticated, reused: true },
+        });
+
+        return NextResponse.json(payload);
+      }
+    }
+
+    const jobId = crypto.randomUUID();
 
     await DB.prepare(
       `INSERT INTO processing_jobs (
@@ -60,11 +109,20 @@ export async function POST(request: Request) {
       )
       .run();
 
+    await DB.prepare(
+      `UPDATE processing_jobs
+         SET source_fingerprint = ?, source_hash = ?
+       WHERE id = ?`,
+    )
+      .bind(sourceFingerprint, fingerprint, jobId)
+      .run();
+
     const payload = {
       jobId,
       status: "created",
       statusUrl: publicStatusUrl(jobId),
       resultUrl: publicResultUrl(jobId),
+      reused: false,
     };
 
     await recordUsageEvent(DB, {

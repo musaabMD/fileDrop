@@ -9,6 +9,8 @@ import {
   FileText,
   FileUp,
   Loader2,
+  ThumbsDown,
+  ThumbsUp,
   RotateCcw,
   Sparkles,
   X,
@@ -54,6 +56,9 @@ type ApiJob = {
   id: string;
   statusUrl: string;
   resultUrl: string;
+  markdownUrl?: string | null;
+  status?: string;
+  reused?: boolean;
 };
 type AiUsageRecord = {
   provider: "openrouter";
@@ -89,6 +94,17 @@ function readFileBuffer(file: File) {
     reader.onload = () => resolve(reader.result as ArrayBuffer);
     reader.readAsArrayBuffer(file);
   });
+}
+
+async function fingerprintFile(file: File) {
+  const bytes = await readFileBuffer(file);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+
+  return {
+    sourceHash: hash,
+    sourceFingerprint: `${hash}:${file.size}:${file.name.toLowerCase()}`,
+  };
 }
 
 function loadImage(src: string) {
@@ -674,7 +690,7 @@ function answerDisplayText(question: CanonicalQuestion) {
     : question.answer.sourceChoiceLabel;
 }
 
-async function createApiJob(file: File): Promise<ApiJob> {
+async function createApiJob(file: File, fingerprint: { sourceHash: string; sourceFingerprint: string }): Promise<ApiJob> {
   const response = await fetch("/api/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -682,6 +698,9 @@ async function createApiJob(file: File): Promise<ApiJob> {
       filename: file.name,
       fileSize: file.size,
       contentType: file.type || "application/pdf",
+      pageCount: undefined,
+      sourceHash: fingerprint.sourceHash,
+      sourceFingerprint: fingerprint.sourceFingerprint,
     }),
   });
 
@@ -694,9 +713,19 @@ async function createApiJob(file: File): Promise<ApiJob> {
     jobId: string;
     statusUrl: string;
     resultUrl: string;
+    markdownUrl?: string | null;
+    status?: string;
+    reused?: boolean;
   };
 
-  return { id: payload.jobId, statusUrl: payload.statusUrl, resultUrl: payload.resultUrl };
+  return {
+    id: payload.jobId,
+    statusUrl: payload.statusUrl,
+    resultUrl: payload.resultUrl,
+    markdownUrl: payload.markdownUrl ?? null,
+    status: payload.status,
+    reused: payload.reused,
+  };
 }
 
 async function saveApiResult({
@@ -749,6 +778,23 @@ async function saveApiResult({
   }
 
   return (await response.json()) as { resultUrl: string; markdownUrl: string | null };
+}
+
+async function loadSavedJob(jobId: string) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/result`);
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { message?: string; error?: string } | null;
+    throw new Error(payload?.message ?? payload?.error ?? "Could not load cached result.");
+  }
+
+  return (await response.json()) as {
+    document?: { filename?: string };
+    questions?: CanonicalQuestion[];
+    assets?: Array<LocalAsset & { url?: string }>;
+    pages?: MarkdownPage[];
+    warnings?: string[];
+    usage?: AiUsageRecord[];
+  };
 }
 
 function dataUrlContentType(value?: string) {
@@ -1538,6 +1584,10 @@ export default function Home() {
   const [feedbackNotes, setFeedbackNotes] = useState("");
   const [feedbackSending, setFeedbackSending] = useState(false);
   const [feedbackSent, setFeedbackSent] = useState(false);
+  const [pdfQuestion, setPdfQuestion] = useState("");
+  const [pdfAnswer, setPdfAnswer] = useState("");
+  const [pdfAsking, setPdfAsking] = useState(false);
+  const [pdfError, setPdfError] = useState("");
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1594,12 +1644,19 @@ export default function Home() {
     setFeedbackNotes("");
     setFeedbackSending(false);
     setFeedbackSent(false);
+    setPdfQuestion("");
+    setPdfAnswer("");
+    setPdfAsking(false);
+    setPdfError("");
     setQuizAnswers({});
     setSimpleQuizIndex(0);
     setSubmitted(false);
     setError("");
 
     try {
+      setPhase("rendering");
+      setProgress({ current: 0, total: 0, label: "checking file cache" });
+      const fingerprint = await fingerprintFile(file);
       const runStartedAt = performance.now();
       const nextQuestions: CanonicalQuestion[] = [];
       const nextAssets: LocalAsset[] = [];
@@ -1609,8 +1666,25 @@ export default function Home() {
       let currentApiJob: ApiJob | null = null;
 
       try {
-        currentApiJob = await createApiJob(file);
+        currentApiJob = await createApiJob(file, fingerprint);
         setApiJob(currentApiJob);
+
+        if (currentApiJob.reused && currentApiJob.status === "completed" && currentApiJob.resultUrl) {
+          const cached = await loadSavedJob(currentApiJob.id);
+          setQuestions((cached.questions ?? []).map((question) => question));
+          setAssets(
+            (cached.assets ?? []).map((asset) => ({
+              ...asset,
+              previewUrl: asset.previewUrl ?? asset.url,
+            })),
+          );
+          setWarnings(cached.warnings ?? []);
+          setMarkdownPages(cached.pages ?? []);
+          setAiUsage(cached.usage ?? []);
+          setPhase("done");
+          setTab("review");
+          return;
+        }
       } catch (apiError) {
         nextWarnings.push(
           `API job tracking unavailable: ${
@@ -1823,6 +1897,42 @@ export default function Home() {
     }
   }
 
+  async function askPdf() {
+    const question = pdfQuestion.trim();
+    if (!question || pdfAsking) {
+      return;
+    }
+
+    setPdfAsking(true);
+    setPdfError("");
+    setPdfAnswer("");
+
+    try {
+      const response = await fetch("/api/transform", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "qa",
+          question,
+          text: buildFullMarkdown(fileName, questions, markdownPages),
+          instructions: "Answer directly from the document. Keep it short. Mention page numbers when available.",
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { message?: string; error?: string } | null;
+        throw new Error(payload?.message ?? payload?.error ?? "Could not ask the PDF.");
+      }
+
+      const payload = (await response.json()) as { output?: { markdown?: string }; markdown?: string };
+      setPdfAnswer(payload.output?.markdown ?? payload.markdown ?? "No answer returned.");
+    } catch (error) {
+      setPdfError(error instanceof Error ? error.message : "Could not ask the PDF.");
+    } finally {
+      setPdfAsking(false);
+    }
+  }
+
   function setReviewStatus(
     questionId: string,
     reviewStatus: CanonicalQuestion["reviewStatus"],
@@ -1886,6 +1996,10 @@ export default function Home() {
     setFeedbackNotes("");
     setFeedbackSending(false);
     setFeedbackSent(false);
+    setPdfQuestion("");
+    setPdfAnswer("");
+    setPdfAsking(false);
+    setPdfError("");
     setProgress({ current: 0, total: 0, label: "" });
     setError("");
     setFileName("");
@@ -2011,6 +2125,33 @@ export default function Home() {
               </div>
             ) : null}
 
+            {phase !== "done" && questions.length ? (
+              <section className="mt-6 rounded-[22px] border border-zinc-200 bg-zinc-50 p-4 sm:p-5">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-black text-zinc-900">First results</p>
+                  <p className="text-xs font-bold text-zinc-500">
+                    {questions.length} question{questions.length === 1 ? "" : "s"} extracted so far
+                  </p>
+                </div>
+                <div className="mt-4 grid gap-3">
+                  {questions.slice(0, 3).map((question, index) => (
+                    <article key={question.id} className="rounded-2xl border border-zinc-200 bg-white p-4">
+                      <p className="text-xs font-black uppercase tracking-wide text-sky-600">
+                        Page {question.source.pageNumbers.join(", ")}
+                      </p>
+                      <p className="mt-2 text-sm font-extrabold leading-6 text-zinc-950">
+                        {question.versions.quizReady.stem}
+                      </p>
+                      <p className="mt-2 text-xs font-medium text-zinc-500">
+                        {question.versions.quizReady.choices.length} choices
+                        {index === 2 ? "" : ""}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+
             {error ? (
               <p className="mt-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">
                 {error}
@@ -2039,7 +2180,8 @@ export default function Home() {
                 </div>
 
                 {currentQuestion ? (
-                  <section className="mt-5 rounded-[20px] border-2 border-emerald-100 bg-white p-5 sm:p-7">
+                  <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1.3fr)_minmax(340px,0.7fr)]">
+                    <section className="rounded-[20px] border-2 border-emerald-100 bg-white p-5 sm:p-7">
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <span className="rounded-full bg-[#EAF6FF] px-3 py-1 text-sm font-black text-[#1899D6]">
                         Question {simpleQuizIndex + 1} of {approvedQuestions.length}
@@ -2134,7 +2276,9 @@ export default function Home() {
                         ) : null}
                         {sourcePageScreenshot ? (
                           <details className="mt-3">
-                            <summary className="cursor-pointer text-emerald-800">Source page</summary>
+                            <summary className="cursor-pointer text-emerald-800">
+                              Source page p{sourcePageScreenshot.pageNumber}
+                            </summary>
                             <button
                               type="button"
                               onClick={() => setFullscreenImage(sourcePageScreenshot.imageDataUrl)}
@@ -2159,25 +2303,27 @@ export default function Home() {
                             type="button"
                             onClick={() => setFeedbackRating("like")}
                             disabled={feedbackSending}
-                            className={`rounded-full px-4 py-2 text-sm font-bold ${
+                            aria-label="Like result"
+                            className={`inline-flex items-center gap-2 rounded-full px-3 py-2 text-sm font-bold ${
                               feedbackRating === "like"
                                 ? "bg-emerald-600 text-white"
                                 : "bg-white text-zinc-800 border border-zinc-300"
                             }`}
                           >
-                            Like
+                            <ThumbsUp className="h-4 w-4" />
                           </button>
                           <button
                             type="button"
                             onClick={() => setFeedbackRating("dislike")}
                             disabled={feedbackSending}
-                            className={`rounded-full px-4 py-2 text-sm font-bold ${
+                            aria-label="Dislike result"
+                            className={`inline-flex items-center gap-2 rounded-full px-3 py-2 text-sm font-bold ${
                               feedbackRating === "dislike"
                                 ? "bg-rose-600 text-white"
                                 : "bg-white text-zinc-800 border border-zinc-300"
                             }`}
                           >
-                            Dislike
+                            <ThumbsDown className="h-4 w-4" />
                           </button>
                         </div>
                         {feedbackRating === "dislike" ? (
@@ -2251,6 +2397,37 @@ export default function Home() {
                       </button>
                     </div>
                   </section>
+
+                    <aside className="rounded-[20px] border-2 border-zinc-200 bg-white p-5 sm:p-7">
+                      <p className="text-sm font-black uppercase tracking-wide text-zinc-500">
+                        Chat with PDF
+                      </p>
+                      <p className="mt-2 text-sm leading-6 text-zinc-600">
+                        Ask against the extracted Markdown. This does not rerun the parser.
+                      </p>
+                      <textarea
+                        value={pdfQuestion}
+                        onChange={(event) => setPdfQuestion(event.target.value)}
+                        rows={5}
+                        placeholder="Ask a question about the file"
+                        className="mt-4 w-full rounded-2xl border-2 border-zinc-200 px-4 py-3 text-sm outline-none focus:border-sky-400"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void askPdf()}
+                        disabled={pdfAsking || !pdfQuestion.trim()}
+                        className="mt-3 inline-flex items-center justify-center rounded-full bg-zinc-950 px-4 py-2 text-sm font-bold text-white disabled:bg-zinc-300"
+                      >
+                        {pdfAsking ? "Asking..." : "Ask"}
+                      </button>
+                      {pdfError ? <p className="mt-3 text-sm font-medium text-rose-700">{pdfError}</p> : null}
+                      {pdfAnswer ? (
+                        <pre className="mt-4 whitespace-pre-wrap rounded-2xl bg-zinc-50 p-4 text-sm leading-6 text-zinc-800">
+                          {pdfAnswer}
+                        </pre>
+                      ) : null}
+                    </aside>
+                  </div>
                 ) : (
                   <p className="mt-4 rounded-2xl bg-white px-4 py-4 text-center text-sm font-bold text-zinc-600">
                     No quiz questions were found. Try another file.
